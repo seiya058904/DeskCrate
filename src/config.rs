@@ -132,7 +132,7 @@ impl Default for Config {
                 icon_size: 30.0,
                 text_size: 11.5,
                 label_lines: 2,
-                text_shadow: true,
+                text_shadow: false,
                 show_hidden: false,
                 spacing_h: 0.40,
                 spacing_v: 0.60,
@@ -554,7 +554,7 @@ corner = "round"        # square | small | round | large
 icon_size = 30          # 图标尺寸 DIP（24~56）
 text_size = 11.5        # 文件名字号
 label_lines = 2         # 文件名最多行数 0~3（0 = 隐藏文件名）
-text_shadow = true      # 文件名阴影，浅色壁纸上更易读
+text_shadow = false     # 文件名阴影（浅色壁纸上更易读；原版默认关闭）
 show_hidden = false     # 显示隐藏文件
 spacing_h = 0.40        # 水平间距 0~1
 spacing_v = 0.60        # 垂直间距 0~1

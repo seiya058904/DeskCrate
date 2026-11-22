@@ -79,7 +79,6 @@ struct Slide {
     hide: bool,
 }
 
-const GLYPH_FOLDER: char = '\u{E8B7}';
 const GLYPH_MORE: char = '\u{E712}';
 const GLYPH_UP: char = '\u{E70E}';
 const GLYPH_DOWN: char = '\u{E70D}';
@@ -733,7 +732,10 @@ impl Grid {
 
     fn filter_clear_rect(st: &GridState) -> RectF {
         let (w, _) = Self::dims(st);
-        let r = w - theme::TITLE_PAD_R - if st.inside { theme::TITLE_BUTTON + 6.0 } else { 0.0 };
+        let r = match Self::visible_buttons(st).last() {
+            Some(b) => Self::button_rect(st, *b).l - 4.0,
+            None => w - theme::TITLE_PAD_R,
+        };
         RectF::new(r - 26.0, 8.0, r - 2.0, Self::title_h() - 10.0)
     }
 
@@ -942,9 +944,9 @@ impl Grid {
     fn content_area(st: &GridState) -> RectF {
         let (w, h) = Self::dims(st);
         RectF::new(
-            theme::CONTENT_PAD_H,
+            theme::CONTENT_PAD_L,
             Self::title_h() + theme::CONTENT_PAD_TOP,
-            w - theme::CONTENT_PAD_H,
+            w - theme::CONTENT_PAD_R,
             h - theme::CONTENT_PAD_BOTTOM,
         )
     }
@@ -984,9 +986,6 @@ impl Grid {
     }
 
     fn visible_buttons(st: &GridState) -> Vec<Button> {
-        if !st.inside {
-            return Vec::new();
-        }
         let mut v = vec![Button::More];
         if st.cfg.collapse != CollapseMode::Expanded {
             v.push(Button::Fold);
@@ -1047,12 +1046,12 @@ impl Grid {
         let row_h = Self::row_h(st);
         let icon_r = RectF::new(
             theme::TITLE_PAD_L,
-            (row_h - 20.0) / 2.0,
+            ((row_h - theme::TITLE_ICON) / 2.0).round(),
             theme::TITLE_PAD_L + theme::TITLE_ICON,
-            (row_h + 20.0) / 2.0,
+            ((row_h - theme::TITLE_ICON) / 2.0).round() + theme::TITLE_ICON,
         );
         if capsule || st.filter.is_none() {
-            cv.glyph(GLYPH_FOLDER, icon_r, theme::TITLE_ICON, th.accent);
+            cv.vector(crate::ui::vector::LAPTOP, 20.0, icon_r);
         }
         let text_l = icon_r.r + theme::TITLE_ICON_GAP;
         let buttons = Self::visible_buttons(st);
@@ -1092,7 +1091,7 @@ impl Grid {
                 Button::Fold if capsule => GLYPH_DOWN,
                 Button::Fold => GLYPH_UP,
             };
-            cv.glyph(glyph, br, if *b == Button::More { 14.0 } else { 11.0 }, th.text_secondary);
+            cv.glyph(glyph, br, if *b == Button::More { 14.0 } else { 12.0 }, th.text);
         }
         if let Some(None) = st.drop_hl {
             cv.stroke_round(full.inset(1.0, 1.0), (outer - 1.0).max(0.0), th.accent, 2.0);
@@ -1231,7 +1230,10 @@ impl Grid {
             let sample = shell::join(&st.dir, &item.name);
             match icons.get(&key, icon_px, &sample, &bmp_rt, generation) {
                 Some(bmp) => cv.bitmap(&bmp, icon_rect, if item.attrs & 0x2 != 0 { 0.55 } else { 1.0 }),
-                None => cv.fill_round(icon_rect.inset(2.0, 2.0), 6.0, th.placeholder),
+                None => {
+                    let k = icon_rect.w() / 36.0;
+                    cv.fill_round(icon_rect.inset(2.0 * k, 2.0 * k), 8.0 * k, th.placeholder);
+                }
             }
             if m.lines > 0 && editing != Some(i) {
                 if st.labels.get(i).is_some_and(Option::is_none)
@@ -1254,7 +1256,7 @@ impl Grid {
         let content_h = Self::total_height(st, m);
         if content_h > area.h() + 0.5 {
             let (w, _) = Self::dims(st);
-            let track = RectF::new(w - 6.0, area.t + 2.0, w - 6.0 + theme::SCROLLBAR_W, area.b - 2.0);
+            let track = RectF::new(w - 11.5, area.t + 2.0, w - 11.5 + theme::SCROLLBAR_W, area.b - 2.0);
             let thumb_h = (track.h() * area.h() / content_h).max(24.0).min(track.h());
             let max = (content_h - area.h()).max(1.0);
             let t = track.t + (track.h() - thumb_h) * (st.scroll / max).clamp(0.0, 1.0);

@@ -114,7 +114,9 @@ impl GridLayout {
         let cell_h = m.cell_h();
         let cols = ((area.w() / cell_w).floor() as usize).max(1);
         let used = cols as f32 * cell_w;
-        let origin_x = area.l + ((area.w() - used) / 2.0).max(0.0).floor();
+        // Left-aligned like upstream's ItemsWrapGrid; spare width stays on the right.
+        let _ = used;
+        let origin_x = area.l;
         GridLayout { cols, origin_x, origin_y: area.t, cell_w, cell_h, count }
     }
 

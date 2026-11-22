@@ -34,6 +34,10 @@
 | 外圆角 | Round 档为 8 DIP；其余档位：Small 4、Large 16、Square 0（`WidgetCompactBoundsCalculator`） | Win11 用 `DWMWCP_ROUND`（8 px，带系统描边和阴影） |
 | 内圆角（选中框/悬停） | Round 档为 4 DIP | 4 DIP 圆角矩形 |
 | 标题栏 | 最小高度 40；`Padding 14,4,12,4`；图标与标题间距 8；分隔线 `Margin 12,0,12,4`，`Opacity 0.62` | 原样还原 |
+| 标题图标 | Fluent 彩色“笔记本”图标（`managed-storage.svg`，Microsoft MIT 许可）；图标框 18 DIP（`ApplyColorIcon`：clamp(round(size×1.3+3), 18, 34)） | 把 SVG 路径解析为 D2D 几何，配线性渐变原样绘制 |
+| 标题按钮 | “…”常驻显示（`RightActionButtons.Opacity = 1`）；可折叠时折叠按钮也常驻 | 同左 |
+| 内容区 | `FileSurfaceContent` 根 Padding `10,4,8,8`；`ItemsWrapGrid` 左对齐 | 同左 |
+| 文件名 | TextBlock 默认行高（约 1.33 倍字号），最多 2 行，CharacterEllipsis；文字阴影默认关闭 | 同左 |
 | 文字色（深色） | Primary `#F5F5F5`；Secondary `#E8FFFFFF`；Tertiary `#CCFFFFFF`；Disabled `#8FFFFFFF`；分隔线 `#66FFFFFF` | 同左；浅色主题用对应的黑色 alpha |
 | 图标格 | 图标 30 DIP；字号 11.5；文件名 2 行；密度 0.56；水平 0.40、垂直 0.60；名称宽度系数 0.36（`FileWidgetIconLayout`） | 移植布局公式（第 5.4 节） |
 | 状态层（深色/浅色） | 悬停 `#14/#0F`；按下 `#20/#18`；选中 `#28/#20`；选中+悬停 `#38/#2D`；失焦选中 `#10/#0C`。深色用白色、浅色用黑色（`FileItemSurfaceStyleCache`） | 原样还原 |
@@ -179,4 +183,5 @@ margin     = (lerp(0,2,h), lerp(0,2,v))
 1. **内存根因不在图标**：二分测量显示，Shell 取图几乎不占内存；真正的大头是 D2D/DirectWrite 的进程级字形与排版缓存（中文标签时约 12 MB），`ID2D1Device::ClearResources` 和堆压缩都无法回收。最终方案：渲染器（工厂、RT、文字格式）和各格子缓存的 `IDWriteTextLayout` 在最后一次绘制约 4 s 后整体释放，图标缓存只保留像素，位图按渲染代重建。空闲内存因此从 23.8 MB 降到 10.6 MB，空闲后重绘无慢帧（< 12 ms）。
 2. **材质常亮（已修复）**：临时开启“透明效果”后采样发现，从未激活过的窗口从没收到过 `WM_NCACTIVATE`，DWM 一直按未激活画纯色回退（中性灰 31,31,31）。修复办法是应用材质后主动给自己发一次 `WM_NCACTIVATE(TRUE)`，窗口立即呈现带壁纸色调的 Mica（30,31,33）；主题或透明设置变化时也会重发。测试结束后透明设置已恢复为原值 0。说明：任务栏外观由 TranslucentTB 控制，不能作为判断依据。
 3. **未覆盖**：多显示器、混合 DPI（逻辑已实现：稳定显示器标识、按 DIP 存储、`WM_DPICHANGED`）、Win10 回退路径、真实的 Explorer 进程重启（只模拟了 `TaskbarCreated`）。
-4. **范围收敛**：没有实现原版的列表视图、缩略图和胶囊栏编排；配置中也不保留这些选项的空壳。
+4. **视觉对照（2026-11-22）**：把原版 125% 截图缩到 1 px = 1 DIP，和实机渲染并排比对。修正了 7 处偏差：标题图标从字形改为原版的 Fluent 彩色图标；标题文字起点改为 40 DIP；“…”改为常驻；磁贴改为左对齐并采用 10/4/8/8 内边距；文件名改用自然行高；文字阴影默认关闭；滚动条与占位块位置、样式对齐原版。修正后标题行、分隔线、列中心（偏差 < 2 DIP）、行距、图标尺寸都与原版吻合。无法对照的项：选中/悬停态、胶囊、浅色主题（原版截图中没有）。这些只能按源码 token 实现。
+5. **范围收敛**：没有实现原版的列表视图、缩略图和胶囊栏编排；配置中也不保留这些选项的空壳。

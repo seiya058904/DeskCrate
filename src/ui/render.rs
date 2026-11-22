@@ -10,23 +10,25 @@ use std::collections::HashMap;
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_FILL_MODE_WINDING, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
-    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory,
-    ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_GAMMA_2_2,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE,
+    D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap,
+    ID2D1DCRenderTarget, ID2D1Factory, ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_LINE_SPACING_METHOD_UNIFORM,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT,
-    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
-    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_EMERGENCY_BREAK, DWRITE_WORD_WRAPPING_NO_WRAP,
-    DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteInlineObject, IDWriteTextFormat,
-    IDWriteTextLayout,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_WORD_WRAPPING_EMERGENCY_BREAK, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory,
+    IDWriteFactory, IDWriteInlineObject, IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -34,7 +36,7 @@ use windows::Win32::Graphics::Gdi::{
     DeleteObject, HBITMAP, HDC, HGDIOBJ, SRCCOPY, SelectObject,
 };
 use windows::core::{HSTRING, Interface, Result, w};
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::layout::RectF;
 use crate::theme::Rgba;
@@ -73,7 +75,7 @@ type FormatKey = (u32, i32, Align, Wrap, bool);
 
 struct Inner {
     dw: IDWriteFactory,
-    _d2d: ID2D1Factory,
+    d2d: ID2D1Factory,
     rt: ID2D1DCRenderTarget,
     brush: ID2D1SolidColorBrush,
 }
@@ -86,6 +88,8 @@ pub struct Renderer {
     generation: std::cell::Cell<u64>,
     scratch: RefCell<Option<Scratch>>,
     formats: RefCell<HashMap<FormatKey, IDWriteTextFormat>>,
+    /// Vector icon geometry, keyed by path-data address; tied to the factory.
+    geoms: RefCell<HashMap<usize, ID2D1PathGeometry>>,
     pub ui_font: HSTRING,
     pub icon_font: HSTRING,
 }
@@ -104,6 +108,7 @@ impl Renderer {
             generation: std::cell::Cell::new(1),
             scratch: RefCell::new(None),
             formats: RefCell::new(HashMap::new()),
+            geoms: RefCell::new(HashMap::new()),
             ui_font,
             icon_font,
         })
@@ -127,7 +132,7 @@ impl Renderer {
             let rt = d2d.CreateDCRenderTarget(&props).ok()?;
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let brush = rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }, None).ok()?;
-            Some(Inner { dw, _d2d: d2d, rt, brush })
+            Some(Inner { dw, d2d, rt, brush })
         }
     }
 
@@ -137,6 +142,63 @@ impl Renderer {
             *inner = Self::create_inner();
         }
         inner.as_ref().map(|i| (i.dw.clone(), i.rt.clone(), i.brush.clone()))
+    }
+
+    /// Path geometry for SVG path data (cached until the next release).
+    fn geometry(&self, d: &'static str) -> Option<ID2D1PathGeometry> {
+        let key = d.as_ptr() as usize;
+        if let Some(g) = self.geoms.borrow().get(&key) {
+            return Some(g.clone());
+        }
+        let factory = self.inner.borrow().as_ref().map(|i| i.d2d.clone())?;
+        let segs = crate::ui::vector::parse(d)?;
+        let v = |p: crate::ui::vector::Pt| Vector2 { X: p.x, Y: p.y };
+        let geom = unsafe {
+            let geom = factory.CreatePathGeometry().ok()?;
+            let sink = geom.Open().ok()?;
+            sink.SetFillMode(D2D1_FILL_MODE_WINDING);
+            let mut open = false;
+            for seg in segs {
+                use crate::ui::vector::Seg;
+                match seg {
+                    Seg::Move(p) => {
+                        if open {
+                            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                        }
+                        sink.BeginFigure(v(p), D2D1_FIGURE_BEGIN_FILLED);
+                        open = true;
+                    }
+                    Seg::Line(p) => sink.AddLine(v(p)),
+                    Seg::Cubic(a, b, p) => {
+                        sink.AddBezier(&D2D1_BEZIER_SEGMENT { point1: v(a), point2: v(b), point3: v(p) })
+                    }
+                    Seg::Arc { to, rx, ry, rot, large, sweep } => sink.AddArc(&D2D1_ARC_SEGMENT {
+                        point: v(to),
+                        size: D2D_SIZE_F { width: rx, height: ry },
+                        rotationAngle: rot,
+                        sweepDirection: if sweep {
+                            D2D1_SWEEP_DIRECTION_CLOCKWISE
+                        } else {
+                            D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE
+                        },
+                        arcSize: if large { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
+                    }),
+                    Seg::Close => {
+                        if open {
+                            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                            open = false;
+                        }
+                    }
+                }
+            }
+            if open {
+                sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            }
+            sink.Close().ok()?;
+            geom
+        };
+        self.geoms.borrow_mut().insert(key, geom.clone());
+        Some(geom)
     }
 
     fn dw(&self) -> Option<IDWriteFactory> {
@@ -193,6 +255,7 @@ impl Renderer {
             free_scratch(s);
         }
         self.formats.borrow_mut().clear();
+        self.geoms.borrow_mut().clear();
         if self.inner.borrow_mut().take().is_some() {
             self.generation.set(self.generation.get() + 1);
         }
@@ -262,8 +325,6 @@ impl Renderer {
                         let _ = f.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
                     }
                     let _ = f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-                    let spacing = (size * 1.4).ceil();
-                    let _ = f.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, spacing, spacing * 0.78);
                 }
             }
             if !icon {
@@ -374,6 +435,40 @@ impl Canvas<'_> {
 
     pub fn unclip(&self) {
         unsafe { self.rt.PopAxisAlignedClip() };
+    }
+
+    /// Draws a multi-layer vector icon (viewBox `size`×`size`) into `r`.
+    pub fn vector(&self, layers: &[crate::ui::vector::Layer], size: f32, r: RectF) {
+        use crate::ui::vector::Fill;
+        let k = r.w() / size;
+        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: r.l, M32: r.t };
+        unsafe {
+            self.rt.SetTransform(&m);
+            for layer in layers {
+                let Some(geom) = self.r.geometry(layer.d) else { continue };
+                match layer.fill {
+                    Fill::Linear { from, to, stops } => {
+                        let st: Vec<D2D1_GRADIENT_STOP> = stops
+                            .iter()
+                            .map(|&(pos, c)| D2D1_GRADIENT_STOP { position: pos, color: Rgba::argb(c).d2d() })
+                            .collect();
+                        let Ok(coll) =
+                            self.rt.CreateGradientStopCollection(&st, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+                        else {
+                            continue;
+                        };
+                        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                            startPoint: Vector2 { X: from.0, Y: from.1 },
+                            endPoint: Vector2 { X: to.0, Y: to.1 },
+                        };
+                        if let Ok(b) = self.rt.CreateLinearGradientBrush(&props, None, &coll) {
+                            self.rt.FillGeometry(&geom, &b, None);
+                        }
+                    }
+                }
+            }
+            self.rt.SetTransform(&Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 });
+        }
     }
 
     pub fn bitmap(&self, b: &ID2D1Bitmap, r: RectF, opacity: f32) {

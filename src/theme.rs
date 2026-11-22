@@ -38,15 +38,18 @@ impl Rgba {
 pub const TITLE_MIN_H: f32 = 40.0;
 pub const TITLE_PAD_L: f32 = 14.0;
 pub const TITLE_PAD_R: f32 = 12.0;
-pub const TITLE_ICON: f32 = 16.0;
+/// Colour title icon box (upstream `ApplyColorIcon`: clamp(round(size + 3), 18, 34)).
+pub const TITLE_ICON: f32 = 18.0;
 pub const TITLE_ICON_GAP: f32 = 8.0;
 pub const TITLE_TEXT: f32 = 13.0;
 pub const TITLE_BUTTON: f32 = 26.0;
 pub const DIVIDER_MARGIN_H: f32 = 12.0;
 pub const DIVIDER_MARGIN_B: f32 = 4.0;
 pub const DIVIDER_OPACITY: f32 = 0.62;
-pub const CONTENT_PAD_H: f32 = 8.0;
-pub const CONTENT_PAD_TOP: f32 = 2.0;
+/// Upstream `FileSurfaceContent` root padding "10,4,8,8".
+pub const CONTENT_PAD_L: f32 = 10.0;
+pub const CONTENT_PAD_R: f32 = 8.0;
+pub const CONTENT_PAD_TOP: f32 = 4.0;
 pub const CONTENT_PAD_BOTTOM: f32 = 8.0;
 pub const RESIZE_EDGE: f32 = 6.0;
 pub const SCROLLBAR_W: f32 = 3.0;
@@ -114,7 +117,7 @@ impl Theme {
                 selected_unfocused: layer(0x10, 0x0C),
                 selected_unfocused_hover: layer(0x1C, 0x15),
                 selected_border: Rgba::argb(0x8BFFFFFF),
-                placeholder: Rgba::argb(0x1FFFFFFF),
+                placeholder: Rgba::argb(0x0AFFFFFF),
                 scrollbar: Rgba::argb(0x66FFFFFF),
             }
         } else {
@@ -133,7 +136,7 @@ impl Theme {
                 selected_unfocused: layer(0x10, 0x0C),
                 selected_unfocused_hover: layer(0x1C, 0x15),
                 selected_border: Rgba::argb(0x72000000),
-                placeholder: Rgba::argb(0x14000000),
+                placeholder: Rgba::argb(0x0A000000),
                 scrollbar: Rgba::argb(0x66000000),
             }
         }
