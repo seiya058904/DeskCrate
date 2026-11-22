@@ -13,14 +13,15 @@ A lean, native Windows desktop organizer written in pure Rust. Desktop "crates" 
 - **Drawer mode**: keeps the desktop empty. A global hotkey or a thin screen-edge hot zone slides in one drawer with a tab for each grid. The hot zone stays out of the way while full-screen apps run.
 - **Type to filter**: start typing in a focused grid or the drawer. If [Everything](https://www.voidtools.com/) is running, matches from across the whole disk appear below the local results (over IPC; nothing is bundled).
 - **Minimal auto filing**: rules match on extension, keyword and idle days, and folders are watched through events. Filing is off and dry-run by default. Files are only ever moved, never deleted or overwritten. Partial downloads are skipped, and every batch can be undone.
+- **No assets**: the application icon and the tray glyph are drawn procedurally (the icon is rasterised by `build.rs` straight into a `.res`), so there is no rc.exe step and no binary files in the repository.
 - **Portable**: one `.exe` plus `config.toml` beside it. The config hot-reloads and keeps your comments when DeskCrate writes positions back. The only registry write is the optional autostart entry.
 
 ## Footprint (measured, release build, Windows 11, two grids)
 
 | Budget | Target | Measured |
 | --- | --- | --- |
-| Executable (static CRT, no runtime) | < 5 MB | **0.74 MB** |
-| Idle private memory | < 20 MB | **~10.6 MB** (working set ~0.7 MB) |
+| Executable (static CRT, no runtime, icon included) | < 5 MB | **0.85 MB** |
+| Idle private memory | < 20 MB | **~11 MB** (working set ~1 MB) |
 | Idle CPU | ~0 | **0.0 ms CPU over 20 s** |
 | Processes / leftovers on exit | none | single process, exits cleanly |
 

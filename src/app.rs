@@ -300,6 +300,13 @@ impl App {
         };
         let dark = self.theme.borrow().dark;
         self.applied.set(win::material::apply(hwnd, material, corner, dark));
+        // A window that was never activated has never told DWM it is "active",
+        // so system backdrops stay on their solid fallback. Our WM_NCACTIVATE
+        // handler always forwards TRUE; send one now (also refreshes the
+        // backdrop after the user toggles transparency effects).
+        unsafe {
+            SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+        }
     }
 
     /// The tint layer depends on what DWM actually gave us.
