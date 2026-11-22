@@ -1,0 +1,7 @@
+/target/
+# Upstream reference clone (GPL-3.0-only, separate history) — never commit.
+/.ref/
+# Runtime files written next to the executable during local runs.
+/config.toml
+/deskcrate-undo.log
+/deskcrate.log
