@@ -6,15 +6,15 @@ use std::rc::{Rc, Weak};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_WEIGHT_NORMAL, DWRITE_HIT_TEST_METRICS, IDWriteTextLayout};
-use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, PAINTSTRUCT, ScreenToClient};
+use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, PAINTSTRUCT, ScreenToClient, UpdateWindow};
 use windows::Win32::System::Ole::{IDropTarget, RegisterDragDrop, RevokeDragDrop};
 use windows::Win32::UI::Input::Ime::{
     CFS_POINT, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_HOVER, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_A,
-    VK_BACK, VK_C, VK_CONTROL, VK_DELETE, VK_END, VK_ESCAPE, VK_F2, VK_F5, VK_HOME, VK_LEFT, VK_MENU, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_V, VK_X,
+    VK_APPS, VK_BACK, VK_C, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F2, VK_F5, VK_F10, VK_HOME, VK_LEFT,
+    VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP, VK_V, VK_X,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::BOOL;
@@ -27,6 +27,7 @@ use crate::shell::dragdrop::{DropHost, GridDropTarget};
 use crate::shell::items::Item;
 use crate::shell::menu::{self, EXTRA_BASE, Extra, Outcome};
 use crate::theme::{self, Rgba};
+use crate::ui::motion::{self, Spring, Tween};
 use crate::ui::render::{self, Align, Canvas, Wrap};
 use crate::ui::textinput::{TextInput, valid_file_name};
 use crate::util::{x_lparam, y_lparam};
@@ -41,16 +42,30 @@ const CMD_REMOVE: u32 = EXTRA_BASE + 4;
 const CMD_MODE_EXPANDED: u32 = EXTRA_BASE + 5;
 const CMD_MODE_CLICK: u32 = EXTRA_BASE + 6;
 const CMD_MODE_SMART: u32 = EXTRA_BASE + 7;
+const CMD_RENAME_TITLE: u32 = EXTRA_BASE + 8;
+const CMD_LOCK_SIZE: u32 = EXTRA_BASE + 9;
 
 /// Not exported by windows-rs' WindowsAndMessaging module.
 const WM_MOUSEHOVER: u32 = 0x02A1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-const TIMER_ANIM: usize = 1;
 const TIMER_COLLAPSE: usize = 2;
-const TIMER_SLIDE: usize = 3;
 const TIMER_HOVER_HIDE: usize = 4;
 const TIMER_QUERY: usize = 5;
+/// Fades the scrollbar out after inactivity (upstream `ScrollBarAutoHideDelay` 3 s).
+const TIMER_BAR: usize = 6;
+/// Marquee auto-scroll near the edges (upstream `InteractiveAutoScrollInterval` 32 ms).
+const TIMER_AUTOSCROLL: usize = 7;
+/// Deferred name expansion / slow-click rename (one double-click interval).
+const TIMER_EXPAND: usize = 8;
+const TIMER_SLOW_RENAME: usize = 9;
+/// Re-check desktop bedding after a launch (upstream: 600 ms after open).
+const TIMER_REBED: usize = 10;
+/// Tooltip show (one double-click interval, like `TTDT_INITIAL`) and auto-pop.
+const TIMER_TIP: usize = 11;
+const TIMER_TIP_HIDE: usize = 12;
+const BAR_HIDE_MS: u32 = 3000;
+const AUTOSCROLL_ZONE: f32 = 28.0;
 
 /// "Everything" results section (DIP).
 const HITS_HEADER_H: f32 = 26.0;
@@ -72,14 +87,39 @@ pub struct Tab {
 
 #[derive(Clone, Copy, Debug)]
 struct Slide {
-    from: (i32, i32),
-    to: (i32, i32),
-    start: u64,
-    dur: u32,
+    x: Spring,
+    y: Spring,
     hide: bool,
 }
 
-const GLYPH_MORE: char = '\u{E712}';
+/// Something with an animated hover highlight.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fx {
+    Tile(usize),
+    Button(Button),
+    Tab(usize),
+    Hit(usize),
+    /// Press depth of a tile / title button (drives the press scale).
+    Press(usize),
+    PressButton(Button),
+    /// Capsule drag grip (replaces the identity icon while hovering its left edge).
+    Grip,
+    /// Selected-name expansion fade (upstream 0.55 → 1 over 90 ms).
+    Expand(usize),
+}
+
+/// Hover highlight fade (ms): quick in, softer out — Fluent "fast in, slow out".
+const FX_IN_MS: f32 = 83.0;
+const FX_OUT_MS: f32 = 167.0;
+/// Press: sinks almost instantly, springs back slower (iOS-like).
+const PRESS_IN_MS: f32 = 60.0;
+const PRESS_OUT_MS: f32 = 260.0;
+const PRESS_SCALE: f32 = 0.05;
+/// Toast lifetime (fade in 120 ms, hold, fade out 220 ms).
+const TOAST_MS: f64 = 1800.0;
+/// Wheel scroll glide.
+const SCROLL_MS: f32 = 180.0;
+
 const GLYPH_UP: char = '\u{E70E}';
 const GLYPH_DOWN: char = '\u{E70D}';
 const GLYPH_SEARCH: char = '\u{E721}';
@@ -87,6 +127,8 @@ const GLYPH_CLEAR: char = '\u{E711}';
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Button {
+    /// Upstream `AddButton` (default hover action): new grid.
+    Add,
     More,
     Fold,
 }
@@ -95,7 +137,7 @@ enum Button {
 enum Drag {
     None,
     Pending { x: i32, y: i32, index: Option<usize>, title: bool, button: Option<Button> },
-    Move { cursor: POINT, rect: RECT },
+    Move { cursor: POINT, rect: RECT, snap: crate::app::SnapState },
     Marquee { x0: f32, y0: f32, x1: f32, y1: f32 },
     PendingHit { x: i32, y: i32, i: usize },
 }
@@ -104,17 +146,30 @@ enum Drag {
 enum Fold {
     Expanded,
     Collapsed,
-    Animating { from: i32, to: i32, start: u64, dur: u32, collapsing: bool },
+    /// Window height (px) driven by a spring; reversible at any frame.
+    Animating {
+        spring: Spring,
+        collapsing: bool,
+    },
 }
 
 struct Edit {
     index: usize,
+    /// Editing the grid title (double-click on the title, upstream `StartTitleRename`).
+    title: bool,
     input: TextInput,
     /// Re-appended on commit when Explorer hides the extension.
     hidden_ext: Option<String>,
     /// Last laid-out text + origin (DIP), for caret hit-testing.
     layout: Option<(IDWriteTextLayout, f32, f32)>,
     surrogate: Option<u16>,
+}
+
+impl GridState {
+    fn last_pt_dip(&self) -> (f32, f32) {
+        let s = win::scale(self.dpi);
+        (self.last_pt.0 as f32 / s, self.last_pt.1 as f32 / s)
+    }
 }
 
 pub struct GridState {
@@ -155,6 +210,28 @@ pub struct GridState {
     outside_ticks: u8,
     pub watch: Option<win::watcher::WatchId>,
     pub error: Option<String>,
+    fx: Vec<(Fx, Tween)>,
+    scroll_tw: Option<Tween>,
+    /// Scrollbar visibility (auto-hides after inactivity).
+    bar: Tween,
+    /// Keyboard focus item (lead of a Shift range; `anchor` is the other end).
+    lead: Option<usize>,
+    /// Sole selection and when it became sole (slow-click rename gating).
+    sole_since: Option<(usize, f64)>,
+    /// Name expansion may show for this item once the time has passed.
+    expand_ready: Option<(usize, f64)>,
+    /// After an open, hover stays off until the pointer actually moves.
+    suppress_hover: Option<(i32, i32)>,
+    /// Last pointer position (client px) for auto-scroll.
+    last_pt: (i32, i32),
+    tooltip: HWND,
+    tip_for: Option<usize>,
+    /// Snap edge glow (left, top, right, bottom).
+    glow: [Tween; 4],
+    /// Transient in-grid feedback (upstream `WidgetFeedbackPresenter`): text, shown at.
+    toast: Option<(String, f64)>,
+    /// Set by a paint that left animations running; consumed by `frame`.
+    wants_frame: bool,
 }
 
 pub struct Grid {
@@ -164,14 +241,12 @@ pub struct Grid {
     pub hwnd: Cell<HWND>,
     pub st: RefCell<GridState>,
     weak: RefCell<Weak<Grid>>,
+    /// Per-grid tile metrics when the icon size is overridden (Ctrl+wheel).
+    m_override: Cell<Option<TileMetrics>>,
 }
 
 fn key_down(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> bool {
     unsafe { GetKeyState(vk.0 as i32) < 0 }
-}
-
-fn ease_out_cubic(t: f32) -> f32 {
-    1.0 - (1.0 - t).powi(3)
 }
 
 impl Grid {
@@ -224,15 +299,51 @@ impl Grid {
                 outside_ticks: 0,
                 watch: None,
                 error: None,
+                fx: Vec::new(),
+                scroll_tw: None,
+                bar: Tween::at(0.0),
+                lead: None,
+                sole_since: None,
+                expand_ready: None,
+                suppress_hover: None,
+                last_pt: (0, 0),
+                tooltip: HWND::default(),
+                tip_for: None,
+                glow: [Tween::at(0.0); 4],
+                toast: None,
+                wants_frame: false,
             }),
             weak: RefCell::new(Weak::new()),
+            m_override: Cell::new(None),
         });
+        g.sync_metrics();
         *g.weak.borrow_mut() = Rc::downgrade(&g);
         g
     }
 
     pub fn hwnd(&self) -> HWND {
         self.hwnd.get()
+    }
+
+    /// Tile metrics for this grid (global appearance + optional icon-size override).
+    fn metrics(&self) -> TileMetrics {
+        self.m_override.get().unwrap_or_else(|| app().metrics.get())
+    }
+
+    fn sync_metrics(&self) {
+        let size = self.st.borrow().cfg.icon_size;
+        self.m_override.set(size.map(|px| {
+            let mut a = app().cfg().appearance.clone();
+            a.icon_size = px;
+            TileMetrics::new(&a)
+        }));
+    }
+
+    /// Shows a short feedback pill at the bottom of the grid.
+    fn toast(&self, text: String) {
+        self.st.borrow_mut().toast = Some((text, motion::now_ms()));
+        self.st.borrow_mut().wants_frame = true;
+        render::invalidate(self.hwnd());
     }
 
     /// Creates the native window for the *expanded* rect (screen px), folds it if
@@ -333,9 +444,9 @@ impl Grid {
                     st.all_items.clear();
                     Self::refilter(&mut st);
                     st.error = Some(if code == 2 || code == 3 {
-                        "找不到文件夹".to_owned()
+                        crate::i18n::tr("grid.not_found")
                     } else {
-                        format!("无法读取文件夹（错误 {code}）")
+                        crate::i18n::tr_n("grid.read_error", code as usize)
                     });
                 }
             }
@@ -370,6 +481,11 @@ impl Grid {
 
     pub fn is_collapsed(&self) -> bool {
         !matches!(self.st.borrow().fold, Fold::Expanded)
+    }
+
+    /// Where the fold is heading: collapsed, or animating toward collapsed.
+    fn heading_collapsed(&self) -> bool {
+        matches!(self.st.borrow().fold, Fold::Collapsed | Fold::Animating { collapsing: true, .. })
     }
 
     fn capsule_px(st: &GridState) -> i32 {
@@ -415,7 +531,6 @@ impl Grid {
             }
         };
         unsafe {
-            let _ = KillTimer(Some(hwnd), TIMER_ANIM);
             let _ = SetWindowPos(
                 hwnd,
                 None,
@@ -444,15 +559,14 @@ impl Grid {
         if hwnd.is_invalid() || self.kind == Kind::Drawer {
             return;
         }
-        let currently = self.is_collapsed();
-        let animating = matches!(self.st.borrow().fold, Fold::Animating { .. });
-        if currently == collapse && !animating {
+        if self.heading_collapsed() == collapse {
             return;
         }
         let expanded = self.expanded_rect();
         let anchor = Self::decide_anchor(&expanded);
-        let dur = app().cfg().capsule.animation_ms;
-        let (from, to) = {
+        let base = app().cfg().capsule.animation_ms as f32;
+        let now = motion::now_ms();
+        let to = {
             let mut st = self.st.borrow_mut();
             if !matches!(st.fold, Fold::Animating { .. }) {
                 st.anchor_bottom = anchor;
@@ -464,15 +578,30 @@ impl Grid {
                 st.hits.clear();
                 Self::refilter(&mut st);
             }
-            (st.size.1, if collapse { Self::capsule_px(&st) } else { Self::expanded_px(&st) })
+            let to = if collapse { Self::capsule_px(&st) } else { Self::expanded_px(&st) } as f32;
+            // Spring tuned so ~90 % of the travel lands within the upstream
+            // SoftOut window; closing is 0.78× like upstream. Slight underdamping kills the\n            // slow tail; any overshoot is clamped to the capsule/expanded size.
+            let (resp, damp) = if collapse { (base * 0.78 * 0.00075, 0.9) } else { (base * 0.00075, 0.86) };
+            if base > 0.0 && animate {
+                let spring = match st.fold {
+                    // Interrupted: keep position and velocity, just change the goal.
+                    Fold::Animating { mut spring, .. } => {
+                        spring.target = to;
+                        spring.tune(resp, damp);
+                        spring
+                    }
+                    _ => Spring::new(st.size.1 as f32, to, resp, damp, now),
+                };
+                st.fold = Fold::Animating { spring, collapsing: collapse };
+            } else {
+                st.fold = if collapse { Fold::Collapsed } else { Fold::Expanded };
+            }
+            to
         };
-        if animate && dur > 0 && from != to {
-            self.st.borrow_mut().fold =
-                Fold::Animating { from, to, start: crate::util::tick_ms(), dur, collapsing: collapse };
-            unsafe { SetTimer(Some(hwnd), TIMER_ANIM, 10, None) };
+        if matches!(self.st.borrow().fold, Fold::Animating { .. }) {
+            self.step_fold(now);
         } else {
-            self.st.borrow_mut().fold = if collapse { Fold::Collapsed } else { Fold::Expanded };
-            self.apply_height(to);
+            self.apply_height(to.round() as i32);
         }
         let (id, mode) = {
             let st = self.st.borrow();
@@ -498,24 +627,163 @@ impl Grid {
         }
     }
 
-    fn on_anim_tick(&self) {
-        let fold = self.st.borrow().fold;
-        let Fold::Animating { from, to, start, dur, collapsing } = fold else {
-            unsafe {
-                let _ = KillTimer(Some(self.hwnd()), TIMER_ANIM);
-            }
-            return;
+    /// Advances the fold spring; `true` while it still runs.
+    fn step_fold(&self, now: f64) -> bool {
+        let (h, done) = {
+            let mut st = self.st.borrow_mut();
+            let Fold::Animating { mut spring, collapsing } = st.fold else { return false };
+            let done = spring.step(now);
+            st.fold = if done {
+                if collapsing { Fold::Collapsed } else { Fold::Expanded }
+            } else {
+                Fold::Animating { spring, collapsing }
+            };
+            // Overshoot of an expanding spring never grows the window past its size.
+            let max = Self::expanded_px(&st) as f32;
+            (spring.x.clamp(Self::capsule_px(&st) as f32, max).round() as i32, done)
         };
-        let t = ((crate::util::tick_ms() - start) as f32 / dur.max(1) as f32).min(1.0);
-        let h = from + ((to - from) as f32 * ease_out_cubic(t)).round() as i32;
-        if t >= 1.0 {
-            self.st.borrow_mut().fold = if collapsing { Fold::Collapsed } else { Fold::Expanded };
+        if h != self.st.borrow().size.1 {
+            self.apply_height(h);
+        }
+        // Paint synchronously so the new size and its content reach DWM in the same frame.
+        render::invalidate(self.hwnd());
+        unsafe {
+            let _ = UpdateWindow(self.hwnd());
+        }
+        !done
+    }
+
+    /// Body transition while folding, as a function of the *current height*
+    /// (not time), so reversing mid-flight is seamless: (opacity, dy, scale).
+    fn body_transition(st: &GridState) -> Option<(f32, f32, f32)> {
+        let Fold::Animating { .. } = st.fold else { return None };
+        let (cap, exp) = (Self::capsule_px(st) as f32, Self::expanded_px(st) as f32);
+        let p = ((st.size.1 as f32 - cap) / (exp - cap).max(1.0)).clamp(0.0, 1.0);
+        let o = motion::smoothstep(motion::track(p, 0.30, 0.85));
+        let dir = if st.anchor_bottom { 1.0 } else { -1.0 };
+        Some((o, dir * 4.0 * (1.0 - o), motion::lerp(0.96, 1.0, motion::out_cubic(o))))
+    }
+
+    pub fn is_busy(&self) -> bool {
+        let st = self.st.borrow();
+        st.edit.is_some() || !matches!(st.drag, Drag::None) || st.drop_hl.is_some() || st.slide.is_some()
+    }
+
+    /// One display frame: steps fold, slide, scroll and hover animations.
+    pub fn frame(&self, now: f64) -> bool {
+        let hwnd = self.hwnd();
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let mut any = self.step_fold(now);
+        any |= self.step_slide(now);
+        let repaint = {
+            let mut st = self.st.borrow_mut();
+            let mut r = std::mem::take(&mut st.wants_frame);
+            if let Some(tw) = st.scroll_tw {
+                st.scroll = tw.value(now);
+                if !tw.active(now) {
+                    st.scroll_tw = None;
+                }
+                r = true;
+            }
+            r
+        };
+        if repaint {
+            render::invalidate(hwnd);
             unsafe {
-                let _ = KillTimer(Some(self.hwnd()), TIMER_ANIM);
+                let _ = UpdateWindow(hwnd);
+            }
+            // The paint re-arms `wants_frame` if hover fades are still running.
+            any |= self.st.borrow().wants_frame || self.st.borrow().scroll_tw.is_some();
+        }
+        {
+            let mut st = self.st.borrow_mut();
+            let mut more = st.bar.active(now);
+            if let Some((_, t)) = st.toast {
+                if now - t > TOAST_MS {
+                    st.toast = None;
+                    more = true;
+                } else {
+                    more = true;
+                }
+            }
+            if more {
+                st.wants_frame = true;
+                any = true;
             }
         }
-        self.apply_height(h);
-        render::invalidate(self.hwnd());
+        any
+    }
+
+    /// Retargets hover fades from the current hover state; called from paint.
+    fn sync_fx(st: &mut GridState, now: f64) {
+        let press = match st.drag {
+            Drag::Pending { index: Some(i), .. } if st.hover == Some(i) => Some(Fx::Press(i)),
+            Drag::Pending { button: Some(b), .. } if st.hover_button == Some(b) => Some(Fx::PressButton(b)),
+            _ => None,
+        };
+        let grip = (Self::capsule_look(st)
+            && st.inside
+            && st.last_pt_dip().0 < theme::CAPSULE_PAD_L + 38.0
+            && matches!(st.drag, Drag::None | Drag::Pending { .. }))
+        .then_some(Fx::Grip);
+        let expand = Self::name_expansion(st, now).map(Fx::Expand);
+        let mut hot: [Option<Fx>; 7] = [
+            grip,
+            expand,
+            press,
+            st.hover.map(Fx::Tile).or(match st.drop_hl {
+                Some(Some(i)) => Some(Fx::Tile(i)),
+                _ => None,
+            }),
+            st.hover_button.map(Fx::Button),
+            st.hover_tab.map(Fx::Tab),
+            st.hit_hover.map(Fx::Hit),
+        ];
+        if !matches!(st.drag, Drag::None | Drag::Pending { .. } | Drag::PendingHit { .. }) {
+            hot = [None, None, None, None, None, None, None];
+        }
+        let ms = |k: &Fx, on: bool| match (k, on) {
+            (Fx::Press(_) | Fx::PressButton(_), true) => PRESS_IN_MS,
+            (Fx::Press(_) | Fx::PressButton(_), false) => PRESS_OUT_MS,
+            (Fx::Expand(_), true) => 90.0,
+            (Fx::Expand(_), false) => 1.0,
+            (Fx::Grip, true) => 140.0,
+            (Fx::Grip, false) => 200.0,
+            (_, true) => FX_IN_MS,
+            (_, false) => FX_OUT_MS,
+        };
+        for (k, tw) in st.fx.iter_mut() {
+            if !hot.contains(&Some(*k)) {
+                tw.set(0.0, ms(k, false), now);
+            }
+        }
+        for k in hot.into_iter().flatten() {
+            match st.fx.iter_mut().find(|(x, _)| *x == k) {
+                Some((_, tw)) => tw.set(1.0, ms(&k, true), now),
+                None => {
+                    let mut tw = Tween::at(0.0);
+                    tw.set(1.0, ms(&k, true), now);
+                    st.fx.push((k, tw));
+                }
+            }
+        }
+        st.fx.retain(|(_, tw)| tw.active(now) || tw.target() > 0.0);
+        if st.fx.iter().any(|(_, tw)| tw.active(now)) {
+            st.wants_frame = true;
+        }
+    }
+
+    fn bar_show(st: &mut GridState, hwnd: HWND) {
+        let now = motion::now_ms();
+        st.bar.set(1.0, 120.0, now);
+        st.wants_frame = true;
+        unsafe { SetTimer(Some(hwnd), TIMER_BAR, BAR_HIDE_MS, None) };
+    }
+
+    fn fx(st: &GridState, k: Fx, now: f64) -> f32 {
+        st.fx.iter().find(|(x, _)| *x == k).map_or(0.0, |(_, tw)| tw.value(now))
     }
 
     fn smart(&self) -> bool {
@@ -523,8 +791,11 @@ impl Grid {
     }
 
     fn arm_collapse_timer(&self) {
-        if self.kind == Kind::Desktop && self.smart() && !self.is_collapsed() {
-            let ms = app().cfg().capsule.collapse_delay_ms.max(50);
+        if self.kind == Kind::Desktop && self.smart() && !self.heading_collapsed() {
+            // Leaving while it is still opening reads as "never mind": fold back sooner.
+            let opening = matches!(self.st.borrow().fold, Fold::Animating { .. });
+            let delay = app().cfg().capsule.collapse_delay_ms;
+            let ms = if opening { delay.min(80) } else { delay }.max(50);
             unsafe { SetTimer(Some(self.hwnd()), TIMER_COLLAPSE, ms, None) };
         }
     }
@@ -604,6 +875,7 @@ impl Grid {
             }
             Self::refilter(&mut st);
             st.scroll = 0.0;
+            st.scroll_tw = None;
             st.hit_sel = None;
             st.hit_hover = None;
             st.query_id = st.query_id.wrapping_add(1);
@@ -716,7 +988,7 @@ impl Grid {
     }
 
     fn hit_row(&self, x: f32, y: f32) -> Option<usize> {
-        let m = app().metrics.get();
+        let m = self.metrics();
         let st = self.st.borrow();
         let area = Self::content_area(&st);
         if st.hits.is_empty() || Self::capsule_look(&st) || !area.contains(x, y) {
@@ -770,6 +1042,7 @@ impl Grid {
             }
             st.tab = i;
             st.scroll = 0.0;
+            st.scroll_tw = None;
             st.edit = None;
             st.cfg.path = t.path.clone();
             st.dir = crate::config::expand_path(&t.path);
@@ -800,21 +1073,26 @@ impl Grid {
             crate::config::Edge::Top => (target.left, target.top - h / 4),
             _ => (target.left + w / 3, target.top),
         };
-        {
+        let now = motion::now_ms();
+        let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+        let from = {
             let mut st = self.st.borrow_mut();
             st.revealed_by_key = by_key;
             st.outside_ticks = 0;
-            st.slide = Some(Slide {
-                from,
-                to: (target.left, target.top),
-                start: crate::util::tick_ms(),
-                dur: 160,
-                hide: false,
-            });
-        }
+            // Re-revealed while sliding out: turn around from where it is, keeping momentum.
+            let (mut x, mut y) = match st.slide {
+                Some(sl) if visible => (sl.x, sl.y),
+                _ => (Spring::new(from.0 as f32, 0.0, 0.0, 0.0, now), Spring::new(from.1 as f32, 0.0, 0.0, 0.0, now)),
+            };
+            for (sp, t) in [(&mut x, target.left), (&mut y, target.top)] {
+                sp.target = t as f32;
+                sp.tune(0.32, 0.86);
+            }
+            st.slide = Some(Slide { x, y, hide: false });
+            (x.x.round() as i32, y.x.round() as i32)
+        };
         unsafe {
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), from.0, from.1, w, h, SWP_SHOWWINDOW | SWP_NOACTIVATE);
-            SetTimer(Some(hwnd), TIMER_SLIDE, 10, None);
             if by_key {
                 let _ = SetForegroundWindow(hwnd);
             } else {
@@ -837,46 +1115,70 @@ impl Grid {
                 st.hits.clear();
                 Self::refilter(&mut st);
             }
-            let w = r.right - r.left;
-            st.slide = Some(Slide {
-                from: (r.left, r.top),
-                to: (r.left + w / 4, r.top),
-                start: crate::util::tick_ms(),
-                dur: 120,
-                hide: true,
-            });
+            let now = motion::now_ms();
+            let (mut x, mut y) = match st.slide {
+                Some(sl) => (sl.x, sl.y),
+                None => (Spring::new(r.left as f32, 0.0, 0.0, 0.0, now), Spring::new(r.top as f32, 0.0, 0.0, 0.0, now)),
+            };
+            let (tx, ty) = Self::offscreen_target(&r, app().cfg().drawer.edge);
+            x.target = tx as f32;
+            y.target = ty as f32;
+            x.tune(0.28, 1.0);
+            y.tune(0.28, 1.0);
+            st.slide = Some(Slide { x, y, hide: true });
         }
         unsafe {
             let _ = KillTimer(Some(hwnd), TIMER_HOVER_HIDE);
-            SetTimer(Some(hwnd), TIMER_SLIDE, 10, None);
         }
     }
 
-    fn on_slide_tick(&self) {
-        let hwnd = self.hwnd();
-        let Some(sl) = self.st.borrow().slide else {
-            unsafe {
-                let _ = KillTimer(Some(hwnd), TIMER_SLIDE);
+    /// Where a concealing drawer slides to: fully past its screen edge when no
+    /// monitor lies beyond (so it never appears on a neighbour), else a third.
+    fn offscreen_target(r: &RECT, edge: crate::config::Edge) -> (i32, i32) {
+        use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        let cy = (r.top + r.bottom) / 2;
+        let cx = (r.left + r.right) / 2;
+        let (probe, full, part) = match edge {
+            crate::config::Edge::Left => {
+                (POINT { x: r.left - 2, y: cy }, (r.left - w - 8, r.top), (r.left - w / 3, r.top))
             }
-            return;
+            crate::config::Edge::Top => {
+                (POINT { x: cx, y: r.top - 2 }, (r.left, r.top - h - 8), (r.left, r.top - h / 4))
+            }
+            _ => (POINT { x: r.right + 2, y: cy }, (r.right + 8, r.top), (r.left + w / 3, r.top)),
         };
-        let t = ((crate::util::tick_ms() - sl.start) as f32 / sl.dur.max(1) as f32).min(1.0);
-        let k = ease_out_cubic(t);
-        let x = sl.from.0 + ((sl.to.0 - sl.from.0) as f32 * k).round() as i32;
-        let y = sl.from.1 + ((sl.to.1 - sl.from.1) as f32 * k).round() as i32;
+        let neighbour = unsafe { !MonitorFromPoint(probe, MONITOR_DEFAULTTONULL).is_invalid() };
+        if neighbour { part } else { full }
+    }
+
+    fn step_slide(&self, now: f64) -> bool {
+        let hwnd = self.hwnd();
+        let Some(mut sl) = self.st.borrow().slide else { return false };
+        let done = sl.x.step(now) & sl.y.step(now);
         unsafe {
-            let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                sl.x.x.round() as i32,
+                sl.y.x.round() as i32,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
-        if t >= 1.0 {
+        if done {
             self.st.borrow_mut().slide = None;
-            unsafe {
-                let _ = KillTimer(Some(hwnd), TIMER_SLIDE);
-                if sl.hide {
+            if sl.hide {
+                unsafe {
                     let _ = ShowWindow(hwnd, SW_HIDE);
-                    app().schedule_idle_trim();
                 }
+                app().schedule_idle_trim();
             }
+            return false;
         }
+        self.st.borrow_mut().slide = Some(sl);
+        true
     }
 
     /// Edge-revealed drawer: hide once the pointer has left it (unless focused).
@@ -962,7 +1264,7 @@ impl Grid {
     }
 
     fn clamp_scroll(&self) {
-        let m = app().metrics.get();
+        let m = self.metrics();
         if let Ok(mut st) = self.st.try_borrow_mut() {
             let max = Self::max_scroll(&st, &m);
             st.scroll = st.scroll.clamp(0.0, max.max(0.0));
@@ -975,18 +1277,27 @@ impl Grid {
 
     fn button_rect(st: &GridState, b: Button) -> RectF {
         let (w, _) = Self::dims(st);
-        let size = theme::TITLE_BUTTON;
-        let top = (Self::row_h(st) - size) / 2.0 - if Self::capsule_look(st) { 0.0 } else { 1.0 };
-        let r = w - theme::TITLE_PAD_R + 4.0;
-        let slot = match b {
-            Button::More => 0.0,
-            Button::Fold => size + 2.0,
-        };
-        RectF::new(r - size - slot, top, r - slot, top + size)
+        let capsule = Self::capsule_look(st);
+        let size = if capsule { theme::CAPSULE_BUTTON } else { theme::TITLE_BUTTON };
+        let top = ((Self::row_h(st) - size) / 2.0 - if capsule { 0.0 } else { 1.0 }).round();
+        let r = w - if capsule { theme::CAPSULE_PAD_R } else { theme::TITLE_PAD_R };
+        // Laid out right-to-left: [Add] [More] [Fold] like upstream's action strip.
+        let list = Self::visible_buttons(st);
+        let slot = list.iter().rev().position(|x| *x == b).unwrap_or(0) as f32;
+        let right = r - slot * (size + theme::TITLE_BUTTON_GAP);
+        RectF::new(right - size, top, right, top + size)
     }
 
     fn visible_buttons(st: &GridState) -> Vec<Button> {
-        let mut v = vec![Button::More];
+        if Self::capsule_look(st) {
+            // Capsule: only the expand chevron (upstream `CompactExpandButton`).
+            return vec![Button::Fold];
+        }
+        let mut v = Vec::new();
+        if st.tabs.is_empty() {
+            v.push(Button::Add);
+        }
+        v.push(Button::More);
         if st.cfg.collapse != CollapseMode::Expanded {
             v.push(Button::Fold);
         }
@@ -1008,7 +1319,7 @@ impl Grid {
         let app = app();
         let theme = app.theme.borrow().clone();
         let ap = app.cfg().appearance.clone();
-        let m = app.metrics.get();
+        let m = self.metrics();
         let Ok(mut st) = self.st.try_borrow_mut() else { return };
         let (pw, ph) = st.size;
         let dpi = st.dpi;
@@ -1040,9 +1351,23 @@ impl Grid {
         let (outer, inner) = theme::corner_radii(ap.corner);
         let full = RectF::new(0.0, 0.0, w, h);
         cv.fill_round(full, outer, app().tint_color(th));
+        let now = motion::now_ms();
+        Self::sync_fx(st, now);
+        if matches!(st.fold, Fold::Animating { .. }) {
+            st.wants_frame = true;
+        }
 
         // ---- title row / capsule ----
         let capsule = Self::capsule_look(st);
+        if capsule {
+            self.draw_capsule(cv, st, th, title, now);
+            self.draw_buttons(cv, st, th, inner, now);
+            if let Some(None) = st.drop_hl {
+                cv.stroke_round(full.inset(1.0, 1.0), (outer - 1.0).max(0.0), th.neutral_line, 1.5);
+            }
+            Self::draw_glow(cv, st, th, now);
+            return;
+        }
         let row_h = Self::row_h(st);
         let icon_r = RectF::new(
             theme::TITLE_PAD_L,
@@ -1050,7 +1375,7 @@ impl Grid {
             theme::TITLE_PAD_L + theme::TITLE_ICON,
             ((row_h - theme::TITLE_ICON) / 2.0).round() + theme::TITLE_ICON,
         );
-        if capsule || st.filter.is_none() {
+        if st.filter.is_none() {
             cv.vector(crate::ui::vector::LAPTOP, 20.0, icon_r);
         }
         let text_l = icon_r.r + theme::TITLE_ICON_GAP;
@@ -1059,58 +1384,44 @@ impl Grid {
         if let Some(last) = buttons.last() {
             right = Self::button_rect(st, *last).l - 4.0;
         }
-        if capsule && st.error.is_none() {
-            // Key info, like the upstream "关键信息" capsule content.
-            let count = format!("{} 项", st.items.len());
-            let cw = 46.0;
-            cv.text(&count, RectF::new(right - cw, 0.0, right, row_h), 11.5, false, Align::Leading, th.text_tertiary);
-            right -= cw + 2.0;
-        }
         let text_r = right.max(text_l + 10.0);
-        if !capsule && st.filter.is_some() {
+        let editing_title = st.edit.as_ref().is_some_and(|e| e.title);
+        if editing_title {
+            self.draw_edit(cv, st, th, m, RectF::new(text_l, 0.0, text_r, row_h), s);
+        } else if st.filter.is_some() {
             self.draw_filter_pill(cv, st, th, icon_r, inner, s);
         } else if self.kind == Kind::Drawer && !st.tabs.is_empty() {
             self.draw_tabs(cv, st, th, text_l, text_r, inner);
         } else {
             cv.text(
                 title,
-                RectF::new(text_l, 0.0, text_r, row_h - if capsule { 0.0 } else { 2.0 }),
+                RectF::new(text_l, 0.0, text_r, row_h - 2.0),
                 theme::TITLE_TEXT,
                 false,
                 Align::Leading,
                 th.text,
             );
         }
-        for b in &buttons {
-            let br = Self::button_rect(st, *b);
-            if st.hover_button == Some(*b) {
-                cv.fill_round(br, inner, th.hover);
-            }
-            let glyph = match b {
-                Button::More => GLYPH_MORE,
-                Button::Fold if capsule => GLYPH_DOWN,
-                Button::Fold => GLYPH_UP,
-            };
-            cv.glyph(glyph, br, if *b == Button::More { 14.0 } else { 12.0 }, th.text);
-        }
+        let _ = buttons;
+        self.draw_buttons(cv, st, th, inner, now);
         if let Some(None) = st.drop_hl {
-            cv.stroke_round(full.inset(1.0, 1.0), (outer - 1.0).max(0.0), th.accent, 2.0);
-        }
-        if capsule {
-            return;
+            cv.stroke_round(full.inset(1.0, 1.0), (outer - 1.0).max(0.0), th.neutral_line, 1.5);
         }
         let dy = Self::title_h() - theme::DIVIDER_MARGIN_B - px / 2.0;
         cv.line(theme::DIVIDER_MARGIN_H, dy, w - theme::DIVIDER_MARGIN_H, dy, th.divider, px);
 
         // ---- content ----
         let area = Self::content_area(st);
+        let group = Self::body_transition(st)
+            .map(|(o, dy, k)| cv.push_group(RectF::new(0.0, Self::title_h(), w, h), o, dy, k))
+            .unwrap_or(false);
         if let Some(err) = &st.error {
             let msg = format!("{err}\n{}", st.dir);
             self.message(cv, area, &msg, th);
         } else if st.items.is_empty() && st.hits.is_empty() {
             let msg = match &st.filter {
-                Some(f) => format!("没有与“{}”匹配的项目", f.text()),
-                None => "空文件夹 — 把文件拖到这里".to_owned(),
+                Some(f) => crate::i18n::trf("grid.no_match", &[&f.text()]),
+                None => crate::i18n::tr("grid.empty"),
             };
             self.message(cv, area, &msg, th);
         } else {
@@ -1123,11 +1434,212 @@ impl Grid {
         if let Drag::Marquee { x0, y0, x1, y1 } = st.drag {
             let r = RectF::new(x0.min(x1), y0.min(y1) - st.scroll, x0.max(x1), y0.max(y1) - st.scroll);
             cv.clip(area);
-            cv.fill_rect(r, th.accent.with_alpha(0.16));
-            cv.stroke_round(r, 0.0, th.accent.with_alpha(0.7), px);
+            // Upstream marquee uses the neutral interaction palette, not the accent.
+            cv.fill_rect(r, th.neutral_fill);
+            cv.stroke_round(r, 0.0, th.neutral_line, px);
             cv.unclip();
         }
-        self.draw_edit(cv, st, th, m, area, s);
+        if st.edit.as_ref().is_some_and(|e| !e.title) {
+            self.draw_edit(cv, st, th, m, area, s);
+        }
+        if group {
+            cv.pop_group();
+        }
+        self.draw_toast(cv, st, th, now);
+        Self::draw_glow(cv, st, th, now);
+    }
+
+    /// Upstream snap highlight: an accent band fading inward from the snapped
+    /// edge, its tips fading out along the edge.
+    fn draw_glow(cv: &Canvas, st: &mut GridState, th: &theme::Theme, now: f64) {
+        let (w, h) = Self::dims(st);
+        let band = theme::SNAP_GLOW;
+        let a = th.accent;
+        let stops = [
+            (0.0, a),
+            (0.22, a.scale_alpha(180.0 / 255.0)),
+            (0.55, a.scale_alpha(70.0 / 255.0)),
+            (1.0, a.with_alpha(0.0)),
+        ];
+        for (i, tw) in st.glow.iter().enumerate() {
+            let k = tw.value(now);
+            if k <= 0.001 {
+                continue;
+            }
+            let st_k: Vec<(f32, Rgba)> = stops.iter().map(|&(p, c)| (p, c.scale_alpha(k))).collect();
+            let vertical = i % 2 == 0;
+            let len = if vertical { h } else { w };
+            // Tip fades along the edge (0–12 % and 88–100 %), drawn as slices.
+            const N: usize = 10;
+            for j in 0..N {
+                let (t0, t1) = (j as f32 / N as f32, (j + 1) as f32 / N as f32);
+                let mid = (t0 + t1) / 2.0;
+                let tip = motion::smoothstep((mid / 0.12).min((1.0 - mid) / 0.12).min(1.0));
+                let tk: Vec<(f32, Rgba)> = st_k.iter().map(|&(p, c)| (p, c.scale_alpha(tip))).collect();
+                let (r, from, to) = match i {
+                    0 => (RectF::new(0.0, len * t0, band, len * t1), (0.0, 0.0), (band, 0.0)),
+                    2 => (RectF::new(w - band, len * t0, w, len * t1), (w, 0.0), (w - band, 0.0)),
+                    1 => (RectF::new(len * t0, 0.0, len * t1, band), (0.0, 0.0), (0.0, band)),
+                    _ => (RectF::new(len * t0, h - band, len * t1, h), (0.0, h), (0.0, h - band)),
+                };
+                cv.fill_gradient(r, from, to, &tk);
+            }
+            if tw.active(now) {
+                st.wants_frame = true;
+            }
+        }
+    }
+
+    fn set_glow(&self, edges: [bool; 4]) {
+        let now = motion::now_ms();
+        let mut st = self.st.borrow_mut();
+        let mut changed = false;
+        for (tw, on) in st.glow.iter_mut().zip(edges) {
+            let target = if on { 1.0 } else { 0.0 };
+            if (tw.target() - target).abs() > 0.5 {
+                tw.set(target, if on { 160.0 } else { 100.0 }, now);
+                changed = true;
+            }
+        }
+        if changed {
+            st.wants_frame = true;
+            drop(st);
+            render::invalidate(self.hwnd());
+        }
+    }
+
+    fn draw_toast(&self, cv: &Canvas, st: &GridState, th: &theme::Theme, now: f64) {
+        let Some((text, t0)) = &st.toast else { return };
+        let age = now - t0;
+        let o = (motion::track(age as f32, 0.0, 120.0)
+            * (1.0 - motion::track(age as f32, (TOAST_MS - 220.0) as f32, TOAST_MS as f32)))
+        .clamp(0.0, 1.0);
+        if o <= 0.0 {
+            return;
+        }
+        let (w, h) = Self::dims(st);
+        let renderer = cv.renderer();
+        let tw = renderer
+            .text_format(12.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Leading, Wrap::Line, false)
+            .and_then(|f| renderer.layout(text, &f, w - 40.0, 30.0))
+            .map_or(60.0, |l| render::text_width(&l));
+        let pw = (tw + 24.0).min(w - 16.0);
+        let rise = 6.0 * (1.0 - motion::out_cubic(motion::track(age as f32, 0.0, 160.0)));
+        let r = RectF::new((w - pw) / 2.0, h - 42.0 + rise, (w + pw) / 2.0, h - 14.0 + rise);
+        let (bg, line) = if th.dark {
+            (Rgba::argb(0xF22C2C2C), Rgba::argb(0x24FFFFFF))
+        } else {
+            (Rgba::argb(0xF5FBFBFB), Rgba::argb(0x17000000))
+        };
+        cv.fill_round(r, 6.0, bg.scale_alpha(o));
+        cv.stroke_round(r.inset(0.5, 0.5), 6.0, line.scale_alpha(o), 1.0);
+        cv.text(text, r.inset(12.0, 0.0), 12.0, false, Align::Center, th.text.scale_alpha(o));
+    }
+
+    fn draw_buttons(&self, cv: &Canvas, st: &GridState, th: &theme::Theme, inner: f32, now: f64) {
+        let capsule = Self::capsule_look(st);
+        for b in Self::visible_buttons(st) {
+            let br = Self::button_rect(st, b);
+            let kp = Self::fx(st, Fx::PressButton(b), now);
+            let fill = th.hover.scale_alpha(Self::fx(st, Fx::Button(b), now)).mix(th.pressed, kp);
+            cv.fill_round(br, inner, fill);
+            let restore =
+                (kp > 0.001).then(|| cv.scale_about(br.l + br.w() / 2.0, br.t + br.h() / 2.0, 1.0 - 0.1 * kp));
+            let icon = theme::TITLE_ACTION_ICON;
+            let ir = RectF::new(
+                br.l + (br.w() - icon) / 2.0,
+                br.t + (br.h() - icon) / 2.0,
+                br.l + (br.w() + icon) / 2.0,
+                br.t + (br.h() + icon) / 2.0,
+            );
+            match b {
+                Button::Add => cv.glyph_fit(&crate::ui::vector::ADD, ir, th.text),
+                Button::More => cv.glyph_fit(&crate::ui::vector::MORE, ir, th.text),
+                Button::Fold if capsule => cv.glyph(GLYPH_DOWN, br, 12.0, th.text),
+                Button::Fold => cv.glyph(GLYPH_UP, br, icon, th.text),
+            }
+            if let Some(m) = restore {
+                cv.set_transform(m);
+            }
+        }
+    }
+
+    /// Upstream "Smart" capsule: identity icon, title · latest item · count,
+    /// expand chevron; the left edge turns into a drag grip on hover.
+    fn draw_capsule(&self, cv: &Canvas, st: &GridState, th: &theme::Theme, title: &str, now: f64) {
+        let (w, h) = Self::dims(st);
+        let s = Self::scale(st);
+        let snap = |v: f32| (v * s).round() / s;
+        let id_l = theme::CAPSULE_PAD_L;
+        let grip = Self::fx(st, Fx::Grip, now);
+        let ic = theme::CAPSULE_ICON;
+        let ix = snap(id_l + (theme::CAPSULE_IDENTITY_W - ic) / 2.0);
+        let iy = snap((h - ic) / 2.0);
+        if grip < 0.999 {
+            let icon_r = RectF::new(ix, iy, ix + ic, iy + ic);
+            if grip > 0.001 {
+                cv.push_group(icon_r.inset(-1.0, -1.0), 1.0 - grip, 0.0, 1.0);
+                cv.vector(crate::ui::vector::LAPTOP, 20.0, icon_r);
+                cv.pop_group();
+            } else {
+                cv.vector(crate::ui::vector::LAPTOP, 20.0, icon_r);
+            }
+        }
+        if grip > 0.001 {
+            // 2 × 3 dots, 2.5 DIP with 3 DIP gaps (upstream `CompactLeftDragGrip`).
+            let (dw, gap) = (2.5, 3.0);
+            let gx = snap(id_l + 8.0);
+            let gy = snap((h - (dw * 3.0 + gap * 2.0)) / 2.0);
+            let c = th.text.scale_alpha(0.9 * grip);
+            for row in 0..3 {
+                for col in 0..2 {
+                    let x = gx + col as f32 * (dw + gap);
+                    let y = gy + row as f32 * (dw + gap);
+                    cv.fill_round(RectF::new(x, y, x + dw, y + dw), dw / 2.0, c);
+                }
+            }
+        }
+        let text_l = id_l + theme::CAPSULE_IDENTITY_W + 4.0;
+        let right =
+            Self::visible_buttons(st).first().map_or(w - theme::CAPSULE_PAD_R, |b| Self::button_rect(st, *b).l) - 6.0;
+        if right <= text_l + 8.0 {
+            return;
+        }
+        let renderer = cv.renderer();
+        let title_w = renderer
+            .text_format(theme::CAPSULE_TITLE, DWRITE_FONT_WEIGHT_NORMAL, Align::Leading, Wrap::Line, false)
+            .and_then(|f| renderer.layout(title, &f, right - text_l, h))
+            .map_or(0.0, |l| render::text_width(&l))
+            .min(right - text_l);
+        cv.text(title, RectF::new(text_l, 0.0, right, h), theme::CAPSULE_TITLE, false, Align::Leading, th.text);
+        // Summary only in Standard/Wide tiers (upstream hides it below 210 DIP).
+        let summary = Self::capsule_summary(st);
+        let sx = text_l + title_w + 6.0;
+        if w >= 210.0 && !summary.is_empty() && sx + 3.0 + 6.0 + 24.0 < right {
+            let dot = RectF::new(sx, (h - 3.0) / 2.0, sx + 3.0, (h + 3.0) / 2.0);
+            cv.fill_round(dot, 1.5, th.text_tertiary);
+            let tx = dot.r + 6.0;
+            cv.text(
+                &summary,
+                RectF::new(tx, 0.0, right, h + 1.0),
+                theme::CAPSULE_SUMMARY,
+                false,
+                Align::Leading,
+                th.text_secondary,
+            );
+        }
+    }
+
+    /// "latest item · N 项" (upstream `CreateFileCompactPresentation`, Smart mode).
+    fn capsule_summary(st: &GridState) -> String {
+        if st.error.is_some() {
+            return String::new();
+        }
+        let count = crate::i18n::tr_n("capsule.count", st.all_items.len());
+        match st.all_items.iter().filter(|i| i.mtime != 0).max_by_key(|i| i.mtime) {
+            Some(latest) => format!("{} · {count}", latest.display),
+            None => count,
+        }
     }
 
     fn draw_tabs(&self, cv: &Canvas, st: &mut GridState, th: &theme::Theme, left: f32, right: f32, inner: f32) {
@@ -1146,8 +1658,8 @@ impl Grid {
             if tr.w() < 12.0 {
                 break;
             }
-            if st.hover_tab == Some(i) && i != st.tab {
-                cv.fill_round(tr, inner, th.hover);
+            if i != st.tab {
+                cv.fill_round(tr, inner, th.hover.scale_alpha(Self::fx(st, Fx::Tab(i), motion::now_ms())));
             }
             let color = if i == st.tab { th.text } else { th.text_secondary };
             cv.text(
@@ -1199,7 +1711,10 @@ impl Grid {
         let icon_px = (m.icon * s).round().max(16.0) as u32;
         let snap = |v: f32| (v * s).round() / s;
         let shadow = ap.text_shadow.then_some(th.shadow);
-        let editing = st.edit.as_ref().map(|e| e.index);
+        let editing = st.edit.as_ref().filter(|e| !e.title).map(|e| e.index);
+        let now = motion::now_ms();
+        let radius = theme::tile_radius(inner);
+        let expanded = Self::name_expansion(st, now);
         cv.clip(area);
         let (bmp_rt, generation) = cv.bitmap_target();
         let mut icons = app().icons.borrow_mut();
@@ -1209,33 +1724,40 @@ impl Grid {
                 continue;
             }
             let sel = st.selected.get(i).copied().unwrap_or(false);
-            let hover = st.hover == Some(i) || st.drop_hl == Some(Some(i));
-            let fill = match (sel, hover, st.active) {
-                (true, true, true) => th.selected_hover,
-                (true, false, true) => th.selected,
-                (true, true, false) => th.selected_unfocused_hover,
-                (true, false, false) => th.selected_unfocused,
-                (false, true, _) => th.hover,
-                _ => Rgba::argb(0),
+            let k = Self::fx(st, Fx::Tile(i), now);
+            let kp = Self::fx(st, Fx::Press(i), now);
+            let restore =
+                (kp > 0.001).then(|| cv.scale_about(r.l + r.w() / 2.0, r.t + r.h() / 2.0, 1.0 - PRESS_SCALE * kp));
+            let fill = match (sel, st.active) {
+                (false, _) if kp > 0.0 => th.hover.scale_alpha(k).mix(th.pressed, kp),
+                (true, true) => th.selected.mix(th.selected_hover, k),
+                (true, false) => th.selected_unfocused.mix(th.selected_unfocused_hover, k),
+                (false, _) => th.hover.scale_alpha(k),
             };
-            cv.fill_round(r, inner, fill);
-            if sel && st.active {
-                cv.stroke_round(r.inset(0.5 / s, 0.5 / s), inner, th.selected_border, 1.0 / s);
+            let is_expanded = expanded == Some(i);
+            if !is_expanded {
+                cv.fill_round(r, radius, fill);
+                if sel && st.active {
+                    cv.stroke_round(r.inset(0.5 / s, 0.5 / s), radius, th.selected_border, 1.0 / s);
+                }
             }
             let item = &st.items[i];
             let ix = snap(r.l + (r.w() - m.icon) / 2.0);
             let iy = snap(r.t + m.pad_y);
             let icon_rect = RectF::new(ix, iy, ix + icon_px as f32 / s, iy + icon_px as f32 / s);
-            let key = item.icon_key(&st.dir);
+            let key = item.icon_key_with(&st.dir, ap.thumbnails);
             let sample = shell::join(&st.dir, &item.name);
             match icons.get(&key, icon_px, &sample, &bmp_rt, generation) {
-                Some(bmp) => cv.bitmap(&bmp, icon_rect, if item.attrs & 0x2 != 0 { 0.55 } else { 1.0 }),
+                Some(bmp) => cv.bitmap_fit(&bmp, icon_rect, if item.attrs & 0x2 != 0 { 0.55 } else { 1.0 }),
                 None => {
+                    // Upstream loading placeholder: 36-unit box, 2 margin, radius 8, 1 px card stroke.
                     let k = icon_rect.w() / 36.0;
-                    cv.fill_round(icon_rect.inset(2.0 * k, 2.0 * k), 8.0 * k, th.placeholder);
+                    let pr = icon_rect.inset(2.0 * k, 2.0 * k);
+                    cv.fill_round(pr, 8.0 * k, th.placeholder);
+                    cv.stroke_round(pr.inset(0.5 / s, 0.5 / s), 8.0 * k, th.placeholder_stroke, 1.0 / s);
                 }
             }
-            if m.lines > 0 && editing != Some(i) {
+            if m.lines > 0 && editing != Some(i) && !is_expanded {
                 if st.labels.get(i).is_some_and(Option::is_none)
                     && let Some(fmt) = &label_fmt
                 {
@@ -1247,9 +1769,83 @@ impl Grid {
                     cv.text_layout_shadowed(l, lx, ly, th.text, shadow);
                 }
             }
+            if let Some(m) = restore {
+                cv.set_transform(m);
+            }
         }
         drop(icons);
+        if let Some(i) = expanded {
+            self.draw_name_expansion(cv, st, th, m, area, radius, s, i, now, label_fmt.as_ref(), shadow);
+        }
         cv.unclip();
+    }
+
+    /// Windows-desktop-style selected-name expansion: a sole, focused selection
+    /// whose label is trimmed grows downward to show the full name (upstream
+    /// `SelectedNameExpansionPolicy`). Returns the expanded item, if any.
+    fn name_expansion(st: &GridState, now: f64) -> Option<usize> {
+        if !st.active || st.edit.is_some() || !matches!(st.drag, Drag::None | Drag::Pending { .. }) {
+            return None;
+        }
+        let mut it = st.selected.iter().enumerate().filter(|(_, s)| **s);
+        let (i, _) = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        match st.expand_ready {
+            Some((j, t)) if j == i && now < t => None,
+            _ => Some(i),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_name_expansion(
+        &self,
+        cv: &Canvas,
+        st: &mut GridState,
+        th: &theme::Theme,
+        m: &TileMetrics,
+        area: RectF,
+        radius: f32,
+        s: f32,
+        i: usize,
+        now: f64,
+        fmt: Option<&windows::Win32::Graphics::DirectWrite::IDWriteTextFormat>,
+        shadow: Option<Rgba>,
+    ) {
+        let gl = Self::grid_layout(st, m);
+        let r = gl.tile_rect(m, i, st.scroll);
+        let snap = |v: f32| (v * s).round() / s;
+        let ly = snap(r.t + m.pad_y) + m.icon + m.spacing;
+        let lx = r.l + (r.w() - m.label_w) / 2.0;
+        let Some(fmt) = fmt else { return };
+        let Some(full) = st.items.get(i).and_then(|it| cv.renderer().layout(&it.display, fmt, m.label_w, 4000.0))
+        else {
+            return;
+        };
+        let mut tm = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
+        unsafe {
+            let _ = full.GetMetrics(&mut tm);
+        }
+        let trimmed = tm.height > m.line_h * m.lines.max(1) as f32 + 0.5;
+        let k = Self::fx(st, Fx::Expand(i), now);
+        // Not trimmed: the normal selected look stays (drawn as usual next frame).
+        let (fill, ring) =
+            if st.active { (th.selected, th.selected_border) } else { (th.selected_unfocused, Rgba::argb(0)) };
+        let bottom = if trimmed { (ly + tm.height + 3.0).min(area.b - 2.0).max(r.b) } else { r.b };
+        let o = r.l;
+        let box_r = RectF::new(o, r.t, r.r, bottom);
+        let alpha = if trimmed { motion::lerp(0.55, 1.0, k) } else { 1.0 };
+        cv.fill_round(box_r, radius, fill.scale_alpha(alpha));
+        cv.stroke_round(box_r.inset(0.5 / s, 0.5 / s), radius, ring.scale_alpha(alpha), 1.0 / s);
+        if trimmed {
+            let max_h = (bottom - ly).max(m.line_h);
+            if let Some(l) = cv.renderer().layout(&st.items[i].display, fmt, m.label_w, max_h) {
+                cv.text_layout_shadowed(&l, lx, ly, th.text.scale_alpha(alpha), shadow);
+            }
+        } else if let Some(Some(l)) = st.labels.get(i) {
+            cv.text_layout_shadowed(l, lx, ly, th.text, shadow);
+        }
     }
 
     fn draw_scrollbar(&self, cv: &Canvas, st: &GridState, th: &theme::Theme, m: &TileMetrics, area: RectF) {
@@ -1260,7 +1856,10 @@ impl Grid {
             let thumb_h = (track.h() * area.h() / content_h).max(24.0).min(track.h());
             let max = (content_h - area.h()).max(1.0);
             let t = track.t + (track.h() - thumb_h) * (st.scroll / max).clamp(0.0, 1.0);
-            let alpha = if st.inside { 1.0 } else { 0.55 };
+            let alpha = st.bar.value(motion::now_ms());
+            if alpha <= 0.001 {
+                return;
+            }
             cv.fill_round(
                 RectF::new(track.l, t, track.r, t + thumb_h),
                 theme::SCROLLBAR_W / 2.0,
@@ -1326,7 +1925,7 @@ impl Grid {
         cv.clip(area);
         let header = RectF::new(area.l + 4.0, top + 4.0, area.r - 4.0, top + HITS_HEADER_H);
         cv.line(header.l, top + 2.0, header.r, top + 2.0, th.divider, 1.0 / s);
-        let title = format!("Everything · 全盘结果  {}", st.hits_total);
+        let title = crate::i18n::tr_n("grid.everything", st.hits_total as usize);
         cv.text(&title, header, 11.0, true, Align::Leading, th.text_tertiary);
         let icon_px = (18.0 * s).round() as u32;
         let (bmp_rt, generation) = cv.bitmap_target();
@@ -1337,12 +1936,9 @@ impl Grid {
                 continue;
             }
             let row = RectF::new(area.l, y + 1.0, area.r - 4.0, y + HITS_ROW_H - 1.0);
-            let fill = match (st.hit_sel == Some(i), st.hit_hover == Some(i)) {
-                (true, true) => th.selected_hover,
-                (true, false) => th.selected,
-                (false, true) => th.hover,
-                _ => Rgba::argb(0),
-            };
+            let k = Self::fx(st, Fx::Hit(i), motion::now_ms());
+            let fill =
+                if st.hit_sel == Some(i) { th.selected.mix(th.selected_hover, k) } else { th.hover.scale_alpha(k) };
             cv.fill_round(row, inner, fill);
             let ix = ((row.l + 6.0) * s).round() / s;
             let iy = ((row.t + (row.h() - 18.0) / 2.0) * s).round() / s;
@@ -1363,22 +1959,33 @@ impl Grid {
 
     /// Inline rename box over the edited tile's label.
     fn draw_edit(&self, cv: &Canvas, st: &mut GridState, th: &theme::Theme, m: &TileMetrics, area: RectF, s: f32) {
-        let Some(index) = st.edit.as_ref().map(|e| e.index) else { return };
-        let gl = Self::grid_layout(st, m);
-        let r = gl.tile_rect(m, index, st.scroll);
-        let box_w = (m.label_w * 1.7).max(m.tile_w + 12.0).min(area.w());
-        let cx = r.l + r.w() / 2.0;
-        let bl = (cx - box_w / 2.0).clamp(area.l, area.r - box_w);
-        let bt = r.t + m.pad_y + m.icon + m.spacing - 3.0;
+        let Some((index, title)) = st.edit.as_ref().map(|e| (e.index, e.title)) else { return };
         let renderer = cv.renderer();
-        let Some(fmt) = renderer.text_format(m.text, DWRITE_FONT_WEIGHT_NORMAL, Align::Center, Wrap::Multi, false)
-        else {
-            return;
+        let (bl, bt, box_w, fmt, line_h) = if title {
+            // `area` is the title text slot; the box hugs it like upstream's title editor.
+            let lh = (theme::TITLE_TEXT * 1.4).ceil();
+            let Some(fmt) =
+                renderer.text_format(theme::TITLE_TEXT, DWRITE_FONT_WEIGHT_NORMAL, Align::Leading, Wrap::Multi, false)
+            else {
+                return;
+            };
+            (area.l - 4.0, ((area.h() - lh - 6.0) / 2.0).round() - 1.0, area.w() + 4.0, fmt, lh)
+        } else {
+            let gl = Self::grid_layout(st, m);
+            let r = gl.tile_rect(m, index, st.scroll);
+            let box_w = (m.label_w * 1.7).max(m.tile_w + 12.0).min(area.w());
+            let cx = r.l + r.w() / 2.0;
+            let bl = (cx - box_w / 2.0).clamp(area.l, area.r - box_w);
+            let bt = r.t + m.pad_y + m.icon + m.spacing - 3.0;
+            let Some(fmt) = renderer.text_format(m.text, DWRITE_FONT_WEIGHT_NORMAL, Align::Center, Wrap::Multi, false)
+            else {
+                return;
+            };
+            (bl, bt, box_w, fmt, m.line_h)
         };
         let Some(edit) = st.edit.as_mut() else { return };
         let text = edit.input.text();
-        let Some(layout) =
-            renderer.layout(if text.is_empty() { " " } else { &text }, &fmt, box_w - 8.0, m.line_h * 6.0)
+        let Some(layout) = renderer.layout(if text.is_empty() { " " } else { &text }, &fmt, box_w - 8.0, line_h * 6.0)
         else {
             return;
         };
@@ -1386,7 +1993,7 @@ impl Grid {
         unsafe {
             let _ = layout.GetMetrics(&mut tm);
         }
-        let bh = tm.height.max(m.line_h) + 6.0;
+        let bh = tm.height.max(line_h) + 6.0;
         let boxr = RectF::new(bl, bt, bl + box_w, bt + bh);
         let (bg, fg) = if th.dark {
             (Rgba::argb(0xFF2B2B2B), Rgba::argb(0xFFFFFFFF))
@@ -1422,7 +2029,7 @@ impl Grid {
             let _ = layout.HitTestTextPosition(pos, false, &mut x, &mut y, &mut hm);
         }
         let caret_x = (tx + x).round_ties_even();
-        cv.line(caret_x, ty + y, caret_x, ty + y + hm.height.max(m.line_h - 2.0), fg, 1.0 / s);
+        cv.line(caret_x, ty + y, caret_x, ty + y + hm.height.max(line_h - 2.0), fg, 1.0 / s);
         edit.layout = Some((layout, tx, ty));
         // Keep the IME candidate window next to the caret.
         let hwnd = self.hwnd();
@@ -1443,7 +2050,7 @@ impl Grid {
     // ---- input ----------------------------------------------------------------------
 
     fn hit_tile(&self, x: f32, y: f32) -> Option<usize> {
-        let m = app().metrics.get();
+        let m = self.metrics();
         let st = self.st.borrow();
         if st.error.is_some() || Self::capsule_look(&st) || !Self::content_area(&st).contains(x, y) {
             return None;
@@ -1522,6 +2129,28 @@ impl Grid {
         let in_title = self.in_title(dy);
         let button = if in_title { self.hit_button(dx, dy) } else { None };
         let tile = if in_title { None } else { self.hit_tile(dx, dy) };
+        // Slow click on the label of an item that already was the settled sole
+        // selection starts rename after one double-click interval (Explorer/upstream).
+        if let Some(i) = tile
+            && !ctrl
+            && !shift
+        {
+            let now = motion::now_ms();
+            let dbl = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() } as f64;
+            let armed = {
+                let st = self.st.borrow();
+                let sole =
+                    st.selected.iter().filter(|s| **s).count() == 1 && st.selected.get(i).copied().unwrap_or(false);
+                let settled = matches!(st.sole_since, Some((j, t)) if j == i && now - t >= dbl);
+                let m = self.metrics();
+                let r = Self::grid_layout(&st, &m).tile_rect(&m, i, st.scroll);
+                let on_label = dy >= r.t + m.pad_y + m.icon + m.spacing - 2.0;
+                st.active && sole && settled && on_label
+            };
+            if armed {
+                unsafe { SetTimer(Some(hwnd), TIMER_SLOW_RENAME, dbl as u32, None) };
+            }
+        }
         {
             let mut st = self.st.borrow_mut();
             if in_title {
@@ -1571,6 +2200,16 @@ impl Grid {
 
     fn on_mouse_move(&self, x: i32, y: i32) {
         let hwnd = self.hwnd();
+        let capsule_hover_change = {
+            let mut st = self.st.borrow_mut();
+            let before = Self::capsule_look(&st) && st.last_pt_dip().0 < theme::CAPSULE_PAD_L + 38.0;
+            st.last_pt = (x, y);
+            let after = Self::capsule_look(&st) && st.last_pt_dip().0 < theme::CAPSULE_PAD_L + 38.0;
+            before != after
+        };
+        if capsule_hover_change {
+            render::invalidate(hwnd);
+        }
         let first_enter = {
             let mut st = self.st.borrow_mut();
             let was = st.inside;
@@ -1581,7 +2220,13 @@ impl Grid {
             unsafe {
                 let _ = KillTimer(Some(hwnd), TIMER_COLLAPSE);
             }
-            let want_hover = self.smart() && self.is_collapsed();
+            // Back over a capsule that is still folding away: the intent is
+            // unambiguous, so turn around now instead of waiting for hover.
+            let folding = matches!(self.st.borrow().fold, Fold::Animating { collapsing: true, .. });
+            if self.smart() && folding {
+                self.set_collapsed(false, true);
+            }
+            let want_hover = self.smart() && self.heading_collapsed();
             self.track_mouse(want_hover);
             render::invalidate(hwnd);
         }
@@ -1607,14 +2252,14 @@ impl Grid {
                     return;
                 }
                 if title {
-                    if self.st.borrow().cfg.locked || self.kind == Kind::Drawer {
+                    if self.st.borrow().cfg.lock_position || self.kind == Kind::Drawer {
                         return;
                     }
                     let mut cursor = POINT::default();
                     unsafe {
                         let _ = GetCursorPos(&mut cursor);
                     }
-                    self.st.borrow_mut().drag = Drag::Move { cursor, rect: win::window_rect(hwnd) };
+                    self.st.borrow_mut().drag = Drag::Move { cursor, rect: win::window_rect(hwnd), snap: [None, None] };
                 } else if index.is_some() {
                     self.st.borrow_mut().drag = Drag::None;
                     unsafe {
@@ -1623,7 +2268,7 @@ impl Grid {
                     self.begin_ole_drag();
                 }
             }
-            Drag::Move { cursor, rect } => {
+            Drag::Move { cursor, rect, snap } => {
                 let mut now = POINT::default();
                 unsafe {
                     let _ = GetCursorPos(&mut now);
@@ -1635,7 +2280,12 @@ impl Grid {
                     right: rect.left + now.x - cursor.x + w,
                     bottom: rect.top + now.y - cursor.y + h,
                 };
-                let snapped = app().snap_rect(&self.id, moved);
+                let (snapped, state, edges) = app().snap_move(&self.id, moved, snap);
+                {
+                    let mut st = self.st.borrow_mut();
+                    st.drag = Drag::Move { cursor, rect, snap: state };
+                }
+                self.set_glow(edges);
                 unsafe {
                     let _ = SetWindowPos(
                         hwnd,
@@ -1649,12 +2299,16 @@ impl Grid {
                 }
             }
             Drag::Marquee { x0, y0, .. } => {
-                let m = app().metrics.get();
+                let m = self.metrics();
                 {
                     let mut st = self.st.borrow_mut();
                     let (dx, dy) = Self::to_dip(&st, x, y);
                     let sy = dy + st.scroll;
                     st.drag = Drag::Marquee { x0, y0, x1: dx, y1: sy };
+                    let area = Self::content_area(&st);
+                    if dy < area.t + AUTOSCROLL_ZONE || dy > area.b - AUTOSCROLL_ZONE {
+                        unsafe { SetTimer(Some(hwnd), TIMER_AUTOSCROLL, 32, None) };
+                    }
                     let sel = RectF::new(x0.min(dx), y0.min(sy), x0.max(dx), y0.max(sy));
                     let gl = Self::grid_layout(&st, &m);
                     let ctrl = key_down(VK_CONTROL);
@@ -1670,7 +2324,22 @@ impl Grid {
                 render::invalidate(hwnd);
             }
             Drag::None => {
+                {
+                    // After an open the hover stays off until the pointer really moves.
+                    let mut st = self.st.borrow_mut();
+                    match st.suppress_hover {
+                        Some(p) if p == (x, y) => return,
+                        Some(_) => st.suppress_hover = None,
+                        None => {}
+                    }
+                }
                 let (dx, dy) = Self::to_dip(&self.st.borrow(), x, y);
+                if !self.is_collapsed() && Self::content_area(&self.st.borrow()).contains(dx, dy) {
+                    let shown = self.st.borrow().bar.target() > 0.5;
+                    if !shown {
+                        Self::bar_show(&mut self.st.borrow_mut(), hwnd);
+                    }
+                }
                 let tile = self.hit_tile(dx, dy);
                 let button = self.hit_button(dx, dy);
                 let tab = self.hit_tab(dx, dy);
@@ -1685,6 +2354,7 @@ impl Grid {
                     c
                 };
                 if changed {
+                    self.update_tooltip(tile);
                     render::invalidate(hwnd);
                 }
             }
@@ -1698,6 +2368,9 @@ impl Grid {
             let _ = ReleaseCapture();
         }
         let (dx, dy) = Self::to_dip(&self.st.borrow(), x, y);
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_AUTOSCROLL);
+        }
         match drag {
             Drag::Pending { index: Some(i), .. } => {
                 if !key_down(VK_CONTROL) && !key_down(VK_SHIFT) {
@@ -1706,9 +2379,21 @@ impl Grid {
                     if let Some(s) = st.selected.get_mut(i) {
                         *s = true;
                     }
+                    st.lead = Some(i);
                 }
+                // A fresh pointer selection expands its name only after a
+                // double-click interval, so a double-click never flashes it.
+                let dbl = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() } as f64;
+                let now = motion::now_ms();
+                let mut st = self.st.borrow_mut();
+                if !matches!(st.expand_ready, Some((j, _)) if j == i) {
+                    st.expand_ready = Some((i, now + dbl));
+                    unsafe { SetTimer(Some(hwnd), TIMER_EXPAND, dbl as u32 + 10, None) };
+                }
+                Self::note_selection(&mut st, now);
             }
             Drag::Pending { title: true, button: Some(b), .. } if self.hit_button(dx, dy) == Some(b) => match b {
+                Button::Add => app().new_grid(),
                 Button::More => {
                     let (br, s) = {
                         let st = self.st.borrow();
@@ -1721,23 +2406,37 @@ impl Grid {
                     self.show_menu(p, None, true);
                 }
                 Button::Fold => {
-                    let collapse = !self.is_collapsed();
+                    let collapse = !self.heading_collapsed();
                     self.set_collapsed(collapse, true);
                 }
             },
             Drag::Pending { title: true, .. } => {
-                // A click on a folded capsule opens it (any mode).
-                if self.is_collapsed() {
+                // A click on a folded capsule opens it (any mode), also mid-collapse.
+                if self.heading_collapsed() {
                     self.set_collapsed(false, true);
                 }
             }
             Drag::Move { .. } => {
+                self.set_glow([false; 4]);
                 self.persist_rect();
                 self.rebed();
             }
+            Drag::Marquee { .. } => Self::note_selection(&mut self.st.borrow_mut(), motion::now_ms()),
             _ => {}
         }
         render::invalidate(hwnd);
+    }
+
+    /// Records when the selection became a single item (slow-click rename gate).
+    fn note_selection(st: &mut GridState, now: f64) {
+        let mut it = st.selected.iter().enumerate().filter(|(_, s)| **s).map(|(i, _)| i);
+        st.sole_since = match (it.next(), it.next()) {
+            (Some(i), None) => match st.sole_since {
+                Some((j, t)) if j == i => Some((j, t)),
+                _ => Some((i, now)),
+            },
+            _ => None,
+        };
     }
 
     fn begin_ole_drag(&self) {
@@ -1754,8 +2453,21 @@ impl Grid {
 
     fn on_double_click(&self, x: i32, y: i32) {
         let (dx, dy) = Self::to_dip(&self.st.borrow(), x, y);
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd()), TIMER_SLOW_RENAME);
+        }
         if self.in_title(dy) {
-            if self.hit_button(dx, dy).is_none() && self.st.borrow().cfg.collapse != CollapseMode::Expanded {
+            if self.hit_button(dx, dy).is_some() {
+                return;
+            }
+            // Upstream: double-clicking the title identity renames the grid.
+            let on_title = {
+                let st = self.st.borrow();
+                !Self::capsule_look(&st) && self.kind == Kind::Desktop && dx < Self::title_text_right(&st)
+            };
+            if on_title {
+                self.begin_title_rename();
+            } else if self.st.borrow().cfg.collapse != CollapseMode::Expanded {
                 let collapse = !self.is_collapsed();
                 self.set_collapsed(collapse, true);
             }
@@ -1774,9 +2486,36 @@ impl Grid {
                 (st.dir.clone(), st.items[i].name.clone())
             };
             shell::open_path(&shell::join(&dir, &name), Some(&dir));
+            self.after_open(&[i], (x, y));
         } else if let Some(i) = self.hit_row(dx, dy) {
             self.open_hit(i);
         }
+    }
+
+    /// Upstream `ClearOpenedItemSelectionAfterDispatch`: the opened items are
+    /// deselected, their hover cleared until the pointer moves, and the desktop
+    /// bedding re-checked once the launched window has settled.
+    fn after_open(&self, opened: &[usize], pt: (i32, i32)) {
+        {
+            let mut st = self.st.borrow_mut();
+            for &i in opened {
+                if let Some(s) = st.selected.get_mut(i) {
+                    *s = false;
+                }
+            }
+            st.hover = None;
+            st.suppress_hover = Some(pt);
+            st.sole_since = None;
+            st.expand_ready = None;
+        }
+        unsafe { SetTimer(Some(self.hwnd()), TIMER_REBED, 600, None) };
+        render::invalidate(self.hwnd());
+    }
+
+    /// Right edge of the title text (hit area for title rename).
+    fn title_text_right(st: &GridState) -> f32 {
+        let list = Self::visible_buttons(st);
+        list.first().map_or(Self::dims(st).0 - theme::TITLE_PAD_R, |b| Self::button_rect(st, *b).l - 4.0)
     }
 
     fn on_rbutton_up(&self, x: i32, y: i32) {
@@ -1825,23 +2564,32 @@ impl Grid {
     }
 
     fn grid_extras(&self) -> Vec<Extra> {
+        use crate::i18n::tr;
         if self.kind == Kind::Drawer {
-            return vec![Extra::item(CMD_OPEN_FOLDER, "在资源管理器中打开"), Extra::item(CMD_REFRESH, "刷新\tF5")];
+            return vec![
+                Extra::item(CMD_OPEN_FOLDER, &tr("menu.open_in_explorer")),
+                Extra::item(CMD_REFRESH, &format!("{}\tF5", tr("menu.refresh"))),
+            ];
         }
-        let (locked, mode) = {
+        let (lock_pos, lock_size, mode) = {
             let st = self.st.borrow();
-            (st.cfg.locked, st.cfg.collapse)
+            (st.cfg.lock_position, st.cfg.lock_size, st.cfg.collapse)
         };
+        // Upstream `CreateMoreFlyout` order: rename, expand behaviour, locks, delete.
         vec![
-            Extra::item(CMD_OPEN_FOLDER, "在资源管理器中打开"),
-            Extra::item(CMD_REFRESH, "刷新\tF5"),
+            Extra::item(CMD_RENAME_TITLE, &tr("menu.rename")),
             Extra::Separator,
-            Extra::check(CMD_MODE_EXPANDED, "常展开", mode == CollapseMode::Expanded),
-            Extra::check(CMD_MODE_CLICK, "点击折叠为胶囊", mode == CollapseMode::Click),
-            Extra::check(CMD_MODE_SMART, "智能胶囊（悬停展开，移出收起）", mode == CollapseMode::Smart),
+            Extra::check(CMD_MODE_EXPANDED, &tr("collapse.expanded"), mode == CollapseMode::Expanded),
+            Extra::check(CMD_MODE_CLICK, &tr("collapse.click"), mode == CollapseMode::Click),
+            Extra::check(CMD_MODE_SMART, &tr("collapse.smart"), mode == CollapseMode::Smart),
             Extra::Separator,
-            Extra::check(CMD_LOCK, "锁定位置和大小", locked),
-            Extra::item(CMD_REMOVE, "移除此格子（文件保持不变）"),
+            Extra::check(CMD_LOCK, &tr("menu.lock_position"), lock_pos),
+            Extra::check(CMD_LOCK_SIZE, &tr("menu.lock_size"), lock_size),
+            Extra::Separator,
+            Extra::item(CMD_OPEN_FOLDER, &tr("menu.open_in_explorer")),
+            Extra::item(CMD_REFRESH, &format!("{}\tF5", tr("menu.refresh"))),
+            Extra::Separator,
+            Extra::item(CMD_REMOVE, &tr("menu.delete_grid")),
         ]
     }
 
@@ -1901,10 +2649,20 @@ impl Grid {
             }
             CMD_REFRESH => self.reload(),
             CMD_LOCK => {
-                let locked = !self.st.borrow().cfg.locked;
-                self.st.borrow_mut().cfg.locked = locked;
-                app().store.borrow_mut().set_grid_flag(&self.id, "locked", locked);
+                let v = !self.st.borrow().cfg.lock_position;
+                self.st.borrow_mut().cfg.lock_position = v;
+                let mut store = app().store.borrow_mut();
+                store.remove_grid_key(&self.id, "locked");
+                store.set_grid_flag(&self.id, "lock_position", v);
             }
+            CMD_LOCK_SIZE => {
+                let v = !self.st.borrow().cfg.lock_size;
+                self.st.borrow_mut().cfg.lock_size = v;
+                let mut store = app().store.borrow_mut();
+                store.remove_grid_key(&self.id, "locked");
+                store.set_grid_flag(&self.id, "lock_size", v);
+            }
+            CMD_RENAME_TITLE => self.begin_title_rename(),
             CMD_MODE_EXPANDED => self.set_mode(CollapseMode::Expanded),
             CMD_MODE_CLICK => self.set_mode(CollapseMode::Click),
             CMD_MODE_SMART => self.set_mode(CollapseMode::Smart),
@@ -1932,6 +2690,7 @@ impl Grid {
             input.select(0, stem_len);
             st.edit = Some(Edit {
                 index,
+                title: false,
                 input,
                 hidden_ext: ext_hidden.then(|| item.ext.clone()).filter(|e| !e.is_empty()),
                 layout: None,
@@ -1950,14 +2709,46 @@ impl Grid {
         render::invalidate(hwnd);
     }
 
+    fn begin_title_rename(&self) {
+        let hwnd = self.hwnd();
+        if self.kind != Kind::Desktop || self.is_collapsed() {
+            return;
+        }
+        {
+            let mut st = self.st.borrow_mut();
+            let mut input = TextInput::new(&Self::title_of(&st));
+            input.select_all();
+            st.edit =
+                Some(Edit { index: usize::MAX, title: true, input, hidden_ext: None, layout: None, surrogate: None });
+        }
+        unsafe {
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetFocus(Some(hwnd));
+        }
+        render::invalidate(hwnd);
+    }
+
+    fn commit_title(&self, text: &str) {
+        let folder = {
+            let st = self.st.borrow();
+            st.dir.rsplit('\\').find(|s| !s.is_empty()).unwrap_or(&st.dir).to_owned()
+        };
+        // An empty title (or the folder's own name) means "follow the folder name".
+        let title = if text.is_empty() || text == folder { String::new() } else { text.to_owned() };
+        self.st.borrow_mut().cfg.title = title.clone();
+        app().store.borrow_mut().set_grid_str(&self.id, "title", &title);
+        render::invalidate(self.hwnd());
+    }
+
     fn ensure_visible(&self, index: usize) {
-        let m = app().metrics.get();
+        let m = self.metrics();
         let mut st = self.st.borrow_mut();
         let area = Self::content_area(&st);
         let gl = Self::grid_layout(&st, &m);
         let r = gl.tile_rect(&m, index, 0.0);
         let top = r.t - area.t;
         let bottom = r.b - area.t + m.line_h * 2.0;
+        st.scroll_tw = None;
         if top < st.scroll {
             st.scroll = top.max(0.0);
         } else if bottom > st.scroll + area.h() {
@@ -1974,6 +2765,10 @@ impl Grid {
 
     fn commit_rename(&self) {
         let Some(edit) = self.st.borrow_mut().edit.take() else { return };
+        if edit.title {
+            self.commit_title(edit.input.text().trim());
+            return;
+        }
         let (dir, old) = {
             let st = self.st.borrow();
             match st.items.get(edit.index) {
@@ -2102,9 +2897,18 @@ impl Grid {
                 for n in names.iter().take(16) {
                     shell::open_path(&shell::join(&dir, n), Some(&dir));
                 }
+                let opened: Vec<usize> = {
+                    let st = self.st.borrow();
+                    st.selected.iter().enumerate().filter(|(_, s)| **s).map(|(i, _)| i).collect()
+                };
+                let pt = self.st.borrow().last_pt;
+                self.after_open(&opened, pt);
             }
             v if v == VK_A.0 && ctrl => {
-                self.st.borrow_mut().selected.iter_mut().for_each(|s| *s = true);
+                let mut st = self.st.borrow_mut();
+                st.selected.iter_mut().for_each(|s| *s = true);
+                Self::note_selection(&mut st, motion::now_ms());
+                drop(st);
                 render::invalidate(hwnd);
             }
             v if v == VK_C.0 && ctrl && !names.is_empty() => {
@@ -2117,6 +2921,12 @@ impl Grid {
                 menu::invoke_verb(owner, &dir, &[], "paste");
             }
             v if v == VK_F5.0 => self.reload(),
+            v if v == VK_APPS.0 || (v == VK_F10.0 && key_down(VK_SHIFT)) => self.keyboard_menu(),
+            v if [VK_LEFT.0, VK_RIGHT.0, VK_UP.0, VK_DOWN.0, VK_HOME.0, VK_END.0, VK_PRIOR.0, VK_NEXT.0]
+                .contains(&v) =>
+            {
+                self.navigate(v);
+            }
             v if v == VK_ESCAPE.0 => {
                 let any = self.st.borrow().selected.iter().any(|s| *s);
                 if !any && self.kind == Kind::Drawer {
@@ -2128,6 +2938,90 @@ impl Grid {
             _ => return false,
         }
         true
+    }
+
+    /// Arrow / Home / End / Page keys move the focus item; Shift extends from
+    /// the anchor, Ctrl moves without selecting (ListView semantics).
+    fn navigate(&self, vk: u16) {
+        let m = self.metrics();
+        let hwnd = self.hwnd();
+        let next = {
+            let st = self.st.borrow();
+            let n = st.items.len();
+            if n == 0 || self.is_collapsed() {
+                return;
+            }
+            let gl = Self::grid_layout(&st, &m);
+            let cols = gl.cols.max(1);
+            let page = ((Self::content_area(&st).h() / m.cell_h()).floor() as usize).max(1) * cols;
+            let cur = st.lead.filter(|&i| i < n).or_else(|| st.selected.iter().position(|s| *s));
+            match cur {
+                None => 0,
+                Some(c) => match vk {
+                    v if v == VK_LEFT.0 => c.saturating_sub(1),
+                    v if v == VK_RIGHT.0 => (c + 1).min(n - 1),
+                    v if v == VK_UP.0 => c.checked_sub(cols).unwrap_or(c),
+                    v if v == VK_DOWN.0 => {
+                        if c + cols < n {
+                            c + cols
+                        } else {
+                            c
+                        }
+                    }
+                    v if v == VK_HOME.0 => 0,
+                    v if v == VK_END.0 => n - 1,
+                    v if v == VK_PRIOR.0 => c.saturating_sub(page),
+                    _ => (c + page).min(n - 1),
+                },
+            }
+        };
+        {
+            let mut st = self.st.borrow_mut();
+            let shift = key_down(VK_SHIFT);
+            let ctrl = key_down(VK_CONTROL);
+            if shift {
+                let a = st.anchor.unwrap_or(next);
+                st.selected.iter_mut().for_each(|s| *s = false);
+                st.selected[a.min(next)..=a.max(next)].iter_mut().for_each(|s| *s = true);
+                st.anchor = Some(a);
+            } else if !ctrl {
+                st.selected.iter_mut().for_each(|s| *s = false);
+                st.selected[next] = true;
+                st.anchor = Some(next);
+            }
+            st.lead = Some(next);
+            st.expand_ready = None;
+            Self::note_selection(&mut st, motion::now_ms());
+        }
+        self.ensure_visible(next);
+        render::invalidate(hwnd);
+    }
+
+    /// Context menu from the keyboard (Apps / Shift+F10), anchored on the focus item.
+    fn keyboard_menu(&self) {
+        let m = self.metrics();
+        let (names, anchor) = {
+            let st = self.st.borrow();
+            let names = Self::selected_names(&st);
+            let lead = st
+                .lead
+                .filter(|&i| st.selected.get(i).copied().unwrap_or(false))
+                .or_else(|| st.selected.iter().position(|s| *s));
+            let s = Self::scale(&st);
+            let pt = match lead {
+                Some(i) => {
+                    let r = Self::grid_layout(&st, &m).tile_rect(&m, i, st.scroll);
+                    POINT { x: ((r.l + r.w() / 2.0) * s) as i32, y: ((r.t + r.h() / 2.0) * s) as i32 }
+                }
+                None => POINT { x: (24.0 * s) as i32, y: (Self::title_h() * s) as i32 },
+            };
+            (names, pt)
+        };
+        let mut p = anchor;
+        unsafe {
+            let _ = ClientToScreen(self.hwnd(), &mut p);
+        }
+        if names.is_empty() { self.show_menu(p, None, true) } else { self.show_menu(p, Some(names), false) }
     }
 
     /// Keys while the filter pill is active. Returns `true` when consumed.
@@ -2191,23 +3085,249 @@ impl Grid {
                 return;
             }
         }
-        let m = app().metrics.get();
+        if key_down(VK_CONTROL) && self.kind == Kind::Desktop {
+            self.zoom_icons(delta);
+            return;
+        }
+        let m = self.metrics();
+        let hwnd = self.hwnd();
         {
             let mut st = self.st.borrow_mut();
             if !matches!(st.fold, Fold::Expanded) {
                 return;
             }
-            st.edit = None;
+            if st.edit.as_ref().is_some_and(|e| !e.title) {
+                st.edit = None;
+            }
+            Self::bar_show(&mut st, hwnd);
             let max = Self::max_scroll(&st, &m);
             let step = m.cell_h() * 0.75;
-            st.scroll = (st.scroll - delta as f32 / 120.0 * step).clamp(0.0, max);
+            let now = motion::now_ms();
+            // Glide toward the accumulated target; successive notches retarget smoothly.
+            let mut tw = st.scroll_tw.unwrap_or(Tween::at(st.scroll));
+            let target = (tw.target() - delta as f32 / 120.0 * step).clamp(0.0, max);
+            tw.set(target, SCROLL_MS, now);
+            st.scroll_tw = Some(tw);
+            st.wants_frame = true;
         }
         render::invalidate(self.hwnd());
     }
 
+    /// Marquee near the top/bottom edge scrolls, faster the closer it gets.
+    fn autoscroll_tick(&self) {
+        let hwnd = self.hwnd();
+        let m = self.metrics();
+        let mut p = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut p);
+            let _ = ScreenToClient(hwnd, &mut p);
+        }
+        let keep = {
+            let mut st = self.st.borrow_mut();
+            let Drag::Marquee { x0, y0, .. } = st.drag else { return self.stop_autoscroll() };
+            let (dx, dy) = Self::to_dip(&st, p.x, p.y);
+            let area = Self::content_area(&st);
+            let v = if dy < area.t + AUTOSCROLL_ZONE {
+                -(area.t + AUTOSCROLL_ZONE - dy).min(60.0)
+            } else if dy > area.b - AUTOSCROLL_ZONE {
+                (dy - (area.b - AUTOSCROLL_ZONE)).min(60.0)
+            } else {
+                0.0
+            };
+            let max = Self::max_scroll(&st, &m);
+            let before = st.scroll;
+            st.scroll_tw = None;
+            st.scroll = (st.scroll + v * 0.35).clamp(0.0, max);
+            let sy = dy.clamp(area.t, area.b) + st.scroll;
+            st.drag = Drag::Marquee { x0, y0, x1: dx, y1: sy };
+            let sel = RectF::new(x0.min(dx), y0.min(sy), x0.max(dx), y0.max(sy));
+            let gl = Self::grid_layout(&st, &m);
+            let ctrl = key_down(VK_CONTROL);
+            for i in 0..st.items.len() {
+                if gl.tile_rect(&m, i, 0.0).intersects(&sel) {
+                    st.selected[i] = true;
+                } else if !ctrl {
+                    st.selected[i] = false;
+                }
+            }
+            v != 0.0 && (st.scroll - before).abs() > 0.01
+        };
+        render::invalidate(hwnd);
+        if !keep {
+            self.stop_autoscroll();
+        }
+    }
+
+    fn stop_autoscroll(&self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd()), TIMER_AUTOSCROLL);
+        }
+    }
+
+    /// Path tooltip for the hovered tile (upstream `ShowFileItemPathTooltips`).
+    /// A *tracked* tooltip shown by our own timer: a subclassing tooltip calls
+    /// `TrackMouseEvent` on the grid and cancels the capsule's hover detection.
+    fn update_tooltip(&self, tile: Option<usize>) {
+        let hwnd = self.hwnd();
+        {
+            let mut st = self.st.borrow_mut();
+            if st.tip_for == tile {
+                return;
+            }
+            st.tip_for = tile;
+        }
+        self.hide_tooltip();
+        if tile.is_some() {
+            let ms = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+            unsafe { SetTimer(Some(hwnd), TIMER_TIP, ms, None) };
+        }
+    }
+
+    fn hide_tooltip(&self) {
+        use windows::Win32::UI::Controls::{TTM_TRACKACTIVATE, TTTOOLINFOW};
+        let hwnd = self.hwnd();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_TIP);
+        }
+        let tip = self.st.borrow().tooltip;
+        if !tip.is_invalid() {
+            let mut ti =
+                TTTOOLINFOW { cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32, hwnd, uId: 1, ..Default::default() };
+            unsafe {
+                SendMessageW(tip, TTM_TRACKACTIVATE, Some(WPARAM(0)), Some(LPARAM(&mut ti as *mut _ as isize)));
+            }
+        }
+    }
+
+    fn show_tooltip(&self) {
+        use windows::Win32::UI::Controls::{
+            TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTM_TRACKACTIVATE,
+            TTM_TRACKPOSITION, TTM_UPDATE, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+        };
+        let hwnd = self.hwnd();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_TIP);
+        }
+        let ok = {
+            let st = self.st.borrow();
+            st.inside
+                && st.tip_for.is_some()
+                && matches!(st.drag, Drag::None)
+                && st.edit.is_none()
+                && !Self::capsule_look(&st)
+        };
+        if !ok {
+            return;
+        }
+        let s = Self::scale(&self.st.borrow());
+        if self.st.borrow().tooltip.is_invalid() {
+            let tip = unsafe {
+                CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+                    TOOLTIPS_CLASSW,
+                    None,
+                    WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    Some(hwnd),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap_or_default()
+            };
+            if tip.is_invalid() {
+                return;
+            }
+            let mut ti = TTTOOLINFOW {
+                cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                uFlags: TTF_TRACK | TTF_ABSOLUTE,
+                hwnd,
+                uId: 1,
+                lpszText: windows::core::PWSTR(-1isize as *mut u16), // LPSTR_TEXTCALLBACK
+                ..Default::default()
+            };
+            unsafe {
+                SendMessageW(tip, TTM_ADDTOOLW, None, Some(LPARAM(&mut ti as *mut _ as isize)));
+                SendMessageW(tip, TTM_SETMAXTIPWIDTH, None, Some(LPARAM((360.0 * s) as isize)));
+            }
+            self.st.borrow_mut().tooltip = tip;
+        }
+        let tip = self.st.borrow().tooltip;
+        let mut p = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut p);
+        }
+        // Below the pointer like a native tooltip (never under it: that would
+        // generate WM_MOUSELEAVE for the grid).
+        let y = p.y + (22.0 * s) as i32;
+        let mut ti =
+            TTTOOLINFOW { cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32, hwnd, uId: 1, ..Default::default() };
+        unsafe {
+            SendMessageW(tip, TTM_TRACKPOSITION, None, Some(LPARAM(((y as u16 as isize) << 16) | p.x as u16 as isize)));
+            SendMessageW(tip, TTM_UPDATE, None, None);
+            SendMessageW(tip, TTM_TRACKACTIVATE, Some(WPARAM(1)), Some(LPARAM(&mut ti as *mut _ as isize)));
+            SetTimer(Some(hwnd), TIMER_TIP_HIDE, 8000, None);
+        }
+    }
+
+    fn on_notify(&self, lp: LPARAM) -> Option<LRESULT> {
+        use windows::Win32::UI::Controls::{NMHDR, NMTTDISPINFOW, TTN_GETDISPINFOW};
+        let hdr = unsafe { &*(lp.0 as *const NMHDR) };
+        if hdr.code != TTN_GETDISPINFOW {
+            return None;
+        }
+        let path = {
+            let st = self.st.borrow();
+            if hdr.hwndFrom != st.tooltip {
+                return None;
+            }
+            let path = st.tip_for.and_then(|i| st.items.get(i)).map(|it| shell::join(&st.dir, &it.name));
+            match path {
+                Some(p) if matches!(st.drag, Drag::None) && st.edit.is_none() => p,
+                _ => String::new(),
+            }
+        };
+        thread_local! {
+            static TIP: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
+        }
+        let di = unsafe { &mut *(lp.0 as *mut NMTTDISPINFOW) };
+        TIP.with(|t| {
+            *t.borrow_mut() = crate::util::wide(&path);
+            di.lpszText = windows::core::PWSTR(t.borrow_mut().as_mut_ptr());
+        });
+        Some(LRESULT(0))
+    }
+
+    /// Ctrl+wheel steps this grid's icon size through upstream's
+    /// `FileWidgetIconSizePolicy` (24…56) and confirms it with a toast.
+    fn zoom_icons(&self, delta: i32) {
+        const STEPS: [f32; 7] = [24.0, 28.0, 32.0, 36.0, 40.0, 48.0, 56.0];
+        if delta == 0 {
+            return;
+        }
+        let cur = self.metrics().icon;
+        let next = if delta > 0 {
+            STEPS.iter().copied().find(|s| *s > cur + 0.01).unwrap_or(STEPS[6])
+        } else {
+            STEPS.iter().rev().copied().find(|s| *s < cur - 0.01).unwrap_or(STEPS[0])
+        };
+        if (next - cur).abs() < 0.01 {
+            return;
+        }
+        self.st.borrow_mut().cfg.icon_size = Some(next);
+        app().store.borrow_mut().set_grid_value(&self.id, "icon_size", toml_edit::value(next as i64));
+        self.sync_metrics();
+        self.drop_text_cache();
+        self.clamp_scroll();
+        self.toast(crate::i18n::trf("toast.icon_size", &[&format!("{next:.0}")]));
+    }
+
     fn hit_test(&self, x: i32, y: i32) -> u32 {
         let st = self.st.borrow();
-        if st.cfg.locked || !matches!(st.fold, Fold::Expanded) || self.kind == Kind::Drawer {
+        if st.cfg.lock_size || !matches!(st.fold, Fold::Expanded) || self.kind == Kind::Drawer {
             return HTCLIENT;
         }
         let r = win::window_rect(self.hwnd());
@@ -2271,11 +3391,58 @@ impl Grid {
             }
             WM_TIMER => {
                 match wp.0 {
-                    TIMER_ANIM => self.on_anim_tick(),
                     TIMER_COLLAPSE => self.on_collapse_timer(),
-                    TIMER_SLIDE => self.on_slide_tick(),
                     TIMER_HOVER_HIDE => self.on_hover_hide_tick(),
                     TIMER_QUERY => self.run_query(),
+                    TIMER_BAR => {
+                        unsafe {
+                            let _ = KillTimer(Some(hwnd), TIMER_BAR);
+                        }
+                        let inside_drag = matches!(self.st.borrow().drag, Drag::Marquee { .. });
+                        if inside_drag {
+                            Self::bar_show(&mut self.st.borrow_mut(), hwnd);
+                        } else {
+                            let mut st = self.st.borrow_mut();
+                            st.bar.set(0.0, 300.0, motion::now_ms());
+                            st.wants_frame = true;
+                        }
+                    }
+                    TIMER_AUTOSCROLL => self.autoscroll_tick(),
+                    TIMER_TIP => self.show_tooltip(),
+                    TIMER_TIP_HIDE => {
+                        unsafe {
+                            let _ = KillTimer(Some(hwnd), TIMER_TIP_HIDE);
+                        }
+                        self.hide_tooltip();
+                    }
+                    TIMER_EXPAND => {
+                        unsafe {
+                            let _ = KillTimer(Some(hwnd), TIMER_EXPAND);
+                        }
+                        render::invalidate(hwnd);
+                    }
+                    TIMER_SLOW_RENAME => {
+                        unsafe {
+                            let _ = KillTimer(Some(hwnd), TIMER_SLOW_RENAME);
+                        }
+                        let sole = {
+                            let st = self.st.borrow();
+                            let mut it = st.selected.iter().enumerate().filter(|(_, s)| **s);
+                            match (it.next(), it.next()) {
+                                (Some((i, _)), None) if matches!(st.drag, Drag::None) => Some(i),
+                                _ => None,
+                            }
+                        };
+                        if let Some(i) = sole {
+                            self.begin_rename(i);
+                        }
+                    }
+                    TIMER_REBED => {
+                        unsafe {
+                            let _ = KillTimer(Some(hwnd), TIMER_REBED);
+                        }
+                        self.rebed();
+                    }
                     _ => {}
                 }
                 Some(LRESULT(0))
@@ -2374,6 +3541,7 @@ impl Grid {
                 }
             }
             WM_LBUTTONDOWN => {
+                self.hide_tooltip();
                 self.on_lbutton_down(x_lparam(lp), y_lparam(lp));
                 Some(LRESULT(0))
             }
@@ -2394,16 +3562,19 @@ impl Grid {
                 Some(LRESULT(0))
             }
             WM_MOUSEHOVER => {
-                if self.smart() && self.is_collapsed() {
+                if self.smart() && self.heading_collapsed() {
                     self.set_collapsed(false, true);
                 }
                 Some(LRESULT(0))
             }
             WM_MOUSELEAVE => {
+                self.hide_tooltip();
                 if let Ok(mut st) = self.st.try_borrow_mut() {
+                    st.tip_for = None;
                     st.inside = false;
                     st.hover = None;
                     st.hover_button = None;
+                    st.last_pt = (-1000, -1000);
                 }
                 self.arm_collapse_timer();
                 render::invalidate(hwnd);
@@ -2427,6 +3598,7 @@ impl Grid {
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL => {
+                self.hide_tooltip();
                 self.on_wheel(crate::util::wheel_delta(wp), POINT { x: x_lparam(lp), y: y_lparam(lp) });
                 Some(LRESULT(0))
             }
@@ -2448,7 +3620,28 @@ impl Grid {
                 }
                 None
             }
+            WM_NOTIFY => self.on_notify(lp),
+            WM_SIZING => {
+                let r = unsafe { &mut *(lp.0 as *mut RECT) };
+                let moving = match wp.0 as u32 {
+                    WMSZ_LEFT => [true, false, false, false],
+                    WMSZ_RIGHT => [false, false, true, false],
+                    WMSZ_TOP => [false, true, false, false],
+                    WMSZ_BOTTOM => [false, false, false, true],
+                    WMSZ_TOPLEFT => [true, true, false, false],
+                    WMSZ_TOPRIGHT => [false, true, true, false],
+                    WMSZ_BOTTOMLEFT => [true, false, false, true],
+                    _ => [false, false, true, true],
+                };
+                let s = win::scale(self.st.borrow().dpi);
+                let min = ((theme::MIN_W * s) as i32, (theme::MIN_H * s) as i32);
+                let (snapped, glow) = app().snap_size(&self.id, *r, moving, min);
+                *r = snapped;
+                self.set_glow(glow);
+                Some(LRESULT(1))
+            }
             WM_EXITSIZEMOVE => {
+                self.set_glow([false; 4]);
                 self.persist_rect();
                 self.rebed();
                 Some(LRESULT(0))
@@ -2456,11 +3649,24 @@ impl Grid {
             WM_DESTROY => {
                 unsafe {
                     let _ = RevokeDragDrop(hwnd);
-                    let _ = KillTimer(Some(hwnd), TIMER_ANIM);
                     let _ = KillTimer(Some(hwnd), TIMER_COLLAPSE);
-                    let _ = KillTimer(Some(hwnd), TIMER_SLIDE);
                     let _ = KillTimer(Some(hwnd), TIMER_HOVER_HIDE);
                     let _ = KillTimer(Some(hwnd), TIMER_QUERY);
+                    for t in [
+                        TIMER_BAR,
+                        TIMER_AUTOSCROLL,
+                        TIMER_EXPAND,
+                        TIMER_SLOW_RENAME,
+                        TIMER_REBED,
+                        TIMER_TIP,
+                        TIMER_TIP_HIDE,
+                    ] {
+                        let _ = KillTimer(Some(hwnd), t);
+                    }
+                    let tip = std::mem::take(&mut self.st.borrow_mut().tooltip);
+                    if !tip.is_invalid() {
+                        let _ = DestroyWindow(tip);
+                    }
                 }
                 if let Some(w) = self.st.borrow_mut().watch.take() {
                     win::watcher::unwatch(w);

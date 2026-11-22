@@ -19,6 +19,8 @@ pub struct Item {
     pub is_dir: bool,
     pub attrs: u32,
     pub ext: String,
+    /// Last write time (FILETIME ticks); drives the capsule's "latest" summary.
+    pub mtime: u64,
 }
 
 /// Icon key for an arbitrary path (search results; attributes unknown).
@@ -39,6 +41,15 @@ const PER_FILE_ICON: &[&str] =
     &["exe", "lnk", "ico", "url", "cur", "ani", "scr", "msc", "cpl", "appref-ms", "website", "pif"];
 
 impl Item {
+    /// Icon key; with `thumbs`, media and files with a shell thumbnail
+    /// provider get a per-file thumbnail (upstream default), like Explorer.
+    pub fn icon_key_with(&self, dir: &str, thumbs: bool) -> IconKey {
+        if thumbs && !self.is_dir && super::icons::has_thumbnail(&self.ext) {
+            return IconKey::Thumb(super::join(dir, &self.name));
+        }
+        self.icon_key(dir)
+    }
+
     pub fn icon_key(&self, dir: &str) -> IconKey {
         if self.is_dir {
             // Explorer marks customised folders (desktop.ini) read-only or system.
@@ -103,7 +114,9 @@ pub fn list(dir: &str, show_hidden: bool, hide_ext: bool) -> Result<Vec<Item>, u
         if !skip {
             let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
             let (display, ext) = display_name(&name, is_dir, hide_ext);
-            out.push(Item { display, ext, is_dir, attrs, name });
+            let t = data.ftLastWriteTime;
+            let mtime = ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+            out.push(Item { display, ext, is_dir, attrs, name, mtime });
         }
         if let Err(e) = unsafe { FindNextFileW(handle, &mut data) } {
             let code = (e.code().0 as u32) & 0xFFFF;
@@ -149,7 +162,14 @@ mod tests {
 
     #[test]
     fn natural_order_folders_first() {
-        let mk = |n: &str, d: bool| Item { name: n.into(), display: n.into(), is_dir: d, attrs: 0, ext: String::new() };
+        let mk = |n: &str, d: bool| Item {
+            name: n.into(),
+            display: n.into(),
+            is_dir: d,
+            attrs: 0,
+            ext: String::new(),
+            mtime: 0,
+        };
         let mut v = vec![mk("file10", false), mk("file2", false), mk("zdir", true)];
         sort(&mut v);
         let names: Vec<_> = v.iter().map(|i| i.name.as_str()).collect();

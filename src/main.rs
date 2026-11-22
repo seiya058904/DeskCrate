@@ -7,6 +7,7 @@
 
 mod app;
 mod config;
+mod i18n;
 mod layout;
 mod shell;
 mod sort;
@@ -45,6 +46,14 @@ fn main() {
 
     if unsafe { OleInitialize(None) }.is_err() {
         return;
+    }
+    // Tooltip class (comctl32 v6 via the manifest).
+    unsafe {
+        let icc = windows::Win32::UI::Controls::INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<windows::Win32::UI::Controls::INITCOMMONCONTROLSEX>() as u32,
+            dwICC: windows::Win32::UI::Controls::ICC_WIN95_CLASSES,
+        };
+        let _ = windows::Win32::UI::Controls::InitCommonControlsEx(&icc);
     }
     let config_path = config::ConfigStore::locate();
     util::init_log(config_path.with_file_name("deskcrate.log"), false);

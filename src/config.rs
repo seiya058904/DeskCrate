@@ -52,6 +52,8 @@ pub struct General {
     pub hotkey: String,
     pub autostart: bool,
     pub log: bool,
+    /// UI language: "auto" follows Windows, or a tag like "en-US" / "zh-CN".
+    pub language: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -64,6 +66,10 @@ pub struct Appearance {
     pub label_lines: u32,
     pub text_shadow: bool,
     pub show_hidden: bool,
+    /// Upstream `ShowFileExtensions` (default off: names show without extensions).
+    pub show_extensions: bool,
+    /// Image/video/document thumbnails instead of type icons (upstream default).
+    pub thumbnails: bool,
     pub spacing_h: f32,
     pub spacing_v: f32,
     pub name_width: f32,
@@ -102,7 +108,11 @@ pub struct GridCfg {
     pub rect: Option<[f32; 4]>,
     pub collapse: CollapseMode,
     pub collapsed: bool,
-    pub locked: bool,
+    /// Upstream splits the lock: position (no dragging) and size (no resizing).
+    pub lock_position: bool,
+    pub lock_size: bool,
+    /// Per-grid icon size override (Ctrl+wheel; upstream `SetIconSizeOverride`).
+    pub icon_size: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,9 +134,10 @@ impl Default for Config {
                 hotkey: "Ctrl+Alt+D".into(),
                 autostart: false,
                 log: false,
+                language: "auto".into(),
             },
             appearance: Appearance {
-                material: Material::Mica,
+                material: Material::Acrylic,
                 tint: 0.18,
                 corner: Corner::Round,
                 icon_size: 30.0,
@@ -134,11 +145,13 @@ impl Default for Config {
                 label_lines: 2,
                 text_shadow: false,
                 show_hidden: false,
+                show_extensions: false,
+                thumbnails: true,
                 spacing_h: 0.40,
                 spacing_v: 0.60,
                 name_width: 0.36,
             },
-            capsule: CapsuleCfg { expand_delay_ms: 360, collapse_delay_ms: 620, animation_ms: 220 },
+            capsule: CapsuleCfg { expand_delay_ms: 100, collapse_delay_ms: 200, animation_ms: 360 },
             drawer: DrawerCfg { edge: Edge::Right, width: 380.0, hot_zone: (0.25, 0.75) },
             sort: crate::sort::SortCfg::default(),
             grids: Vec::new(),
@@ -232,6 +245,7 @@ pub fn parse(doc: &DocumentMut) -> Config {
         hotkey: str_or(get(root, "general", "hotkey"), &d.general.hotkey),
         autostart: bool_or(get(root, "general", "autostart"), false),
         log: bool_or(get(root, "general", "log"), false),
+        language: str_or(get(root, "general", "language"), "auto"),
     };
     let a = &d.appearance;
     let appearance = Appearance {
@@ -257,6 +271,8 @@ pub fn parse(doc: &DocumentMut) -> Config {
         label_lines: u32_in(get(root, "appearance", "label_lines"), a.label_lines, 0, 3),
         text_shadow: bool_or(get(root, "appearance", "text_shadow"), a.text_shadow),
         show_hidden: bool_or(get(root, "appearance", "show_hidden"), a.show_hidden),
+        show_extensions: bool_or(get(root, "appearance", "show_extensions"), a.show_extensions),
+        thumbnails: bool_or(get(root, "appearance", "thumbnails"), a.thumbnails),
         spacing_h: f32_in(get(root, "appearance", "spacing_h"), a.spacing_h, 0.0, 1.0),
         spacing_v: f32_in(get(root, "appearance", "spacing_v"), a.spacing_v, 0.0, 1.0),
         name_width: f32_in(get(root, "appearance", "name_width"), a.name_width, 0.0, 1.0),
@@ -319,7 +335,12 @@ pub fn parse(doc: &DocumentMut) -> Config {
                     ],
                 ),
                 collapsed: bool_or(item("collapsed"), false),
-                locked: bool_or(item("locked"), false),
+                // `locked` is the pre-split key: it still locks both.
+                lock_position: bool_or(item("lock_position"), bool_or(item("locked"), false)),
+                lock_size: bool_or(item("lock_size"), bool_or(item("locked"), false)),
+                icon_size: item("icon_size")
+                    .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+                    .map(|v| (v as f32).clamp(16.0, 96.0)),
             });
         }
     }
@@ -472,6 +493,20 @@ impl ConfigStore {
         self.save();
     }
 
+    pub fn set_grid_value(&mut self, id: &str, key: &str, v: Item) {
+        if let Some(t) = self.grid_table_mut(id) {
+            t.insert(key, v);
+        }
+        self.save();
+    }
+
+    /// Drops a key without saving (callers save with their next write).
+    pub fn remove_grid_key(&mut self, id: &str, key: &str) {
+        if let Some(t) = self.grid_table_mut(id) {
+            t.remove(key);
+        }
+    }
+
     pub fn set_grid_str(&mut self, id: &str, key: &str, v: &str) {
         if let Some(t) = self.grid_table_mut(id) {
             t.insert(key, value(v));
@@ -546,9 +581,10 @@ theme = "system"        # system | dark | light
 hotkey = "Ctrl+Alt+D"   # 抽屉模式下呼出抽屉；桌面模式下临时把全部格子提到最前
 autostart = false       # 开机自启（唯一会写注册表的选项，关闭即删除）
 log = false             # 写 deskcrate.log 便于排障
+language = "auto"       # 界面语言：auto 跟随系统；或 zh-CN、zh-TW、en-US、ja-JP、ko-KR、de-DE、fr-FR、es-ES、pt-BR、ru-RU、ar-SA、hi-IN、bn-BD
 
 [appearance]
-material = "mica"       # mica | mica_alt | acrylic | blur | solid
+material = "acrylic"    # acrylic（默认，实时毛玻璃）| mica | mica_alt | blur | solid
 tint = 0.18             # 材质上方着色层的不透明度 0~1（solid/blur 时为背景不透明度）
 corner = "round"        # square | small | round | large
 icon_size = 30          # 图标尺寸 DIP（24~56）
@@ -556,14 +592,16 @@ text_size = 11.5        # 文件名字号
 label_lines = 2         # 文件名最多行数 0~3（0 = 隐藏文件名）
 text_shadow = false     # 文件名阴影（浅色壁纸上更易读；原版默认关闭）
 show_hidden = false     # 显示隐藏文件
+show_extensions = false # 显示文件扩展名（快捷方式始终隐藏；原版默认关闭）
+thumbnails = true       # 图片、视频和文档显示缩略图
 spacing_h = 0.40        # 水平间距 0~1
 spacing_v = 0.60        # 垂直间距 0~1
 name_width = 0.36       # 文件名宽度 0~1
 
 [capsule]
-expand_delay_ms = 360   # smart 模式：悬停多久展开
-collapse_delay_ms = 620 # smart 模式：移出多久收起
-animation_ms = 220      # 展开/收起动画时长（0 = 无动画）
+expand_delay_ms = 100   # smart 模式：悬停多久展开（与原版一致）
+collapse_delay_ms = 200 # smart 模式：移出多久收起（与原版一致）
+animation_ms = 360      # 展开动画时长，收起为其 0.78 倍（0 = 无动画）
 
 [drawer]                # mode = "drawer" 时生效：桌面保持 100% 干净，按需呼出聚合抽屉
 edge = "right"          # 呼出边缘：left | right | top | none（none = 仅热键）
@@ -642,7 +680,7 @@ path = ""
         .unwrap();
         let c = parse(&doc);
         assert_eq!(c.appearance.icon_size, 56.0);
-        assert_eq!(c.appearance.material, Material::Mica);
+        assert_eq!(c.appearance.material, Material::Acrylic);
         assert_eq!(c.appearance.label_lines, 0);
         assert_eq!(c.grids.len(), 1);
         assert_eq!(c.grids[0].rect, Some([1.0, 2.0, crate::theme::MIN_W, crate::theme::MIN_H]));

@@ -191,8 +191,40 @@ pub fn parse(d: &str) -> Option<Vec<Seg>> {
 /// Fill of one icon layer: a linear gradient in viewBox coordinates.
 #[derive(Clone, Copy, Debug)]
 pub enum Fill {
-    Linear { from: (f32, f32), to: (f32, f32), stops: &'static [(f32, u32)] },
+    Linear {
+        from: (f32, f32),
+        to: (f32, f32),
+        stops: &'static [(f32, u32)],
+    },
+    /// The caller's foreground colour (monochrome Fluent action icons).
+    Current,
 }
+
+/// A monochrome icon plus its path bounds; upstream draws these with
+/// `Stretch="Uniform"`, i.e. the *bounds* are fitted into the icon box.
+#[derive(Clone, Copy, Debug)]
+pub struct Glyph {
+    pub layers: &'static [Layer],
+    pub bounds: (f32, f32, f32, f32),
+}
+
+/// Fluent "add circle 20 regular" — upstream title `AddButton`.
+pub const ADD: Glyph = Glyph {
+    layers: &[Layer {
+        d: "M6 10c0-.28.22-.5.5-.5h3v-3a.5.5 0 0 1 1 0v3h3a.5.5 0 0 1 0 1h-3v3a.5.5 0 0 1-1 0v-3h-3A.5.5 0 0 1 6 10Zm4 8a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm0-1a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z",
+        fill: Fill::Current,
+    }],
+    bounds: (2.0, 2.0, 18.0, 18.0),
+};
+
+/// Fluent "more horizontal 20 regular" — upstream title `MoreButton`.
+pub const MORE: Glyph = Glyph {
+    layers: &[Layer {
+        d: "M5 9a1 1 0 1 0 0 2 1 1 0 0 0 0-2Zm5 0a1 1 0 1 0 0 2 1 1 0 0 0 0-2Zm5 0a1 1 0 1 0 0 2 1 1 0 0 0 0-2Z",
+        fill: Fill::Current,
+    }],
+    bounds: (4.0, 9.0, 16.0, 11.0),
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Layer {

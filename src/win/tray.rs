@@ -45,6 +45,15 @@ pub fn add(hwnd: HWND, callback_msg: u32, icon: HICON, tip: &str) -> bool {
     }
 }
 
+pub fn set_tip(hwnd: HWND, tip: &str) {
+    let mut nid = base(hwnd);
+    nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+    copy_into(&mut nid.szTip, tip);
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
 pub fn set_icon(hwnd: HWND, icon: HICON) {
     let mut nid = base(hwnd);
     nid.uFlags = NIF_ICON;

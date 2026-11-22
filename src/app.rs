@@ -20,6 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::config::{Appearance, Config, ConfigStore, Edge, GridCfg, Material, Mode, ThemePref};
+use crate::i18n::{tr, tr_n, trf};
 use crate::layout::TileMetrics;
 use crate::shell::icons::IconCache;
 use crate::shell::menu::{self, Extra};
@@ -64,9 +65,17 @@ const CMD_DRAWER_MODE: u32 = 8;
 const CMD_SHOW_DRAWER: u32 = 9;
 const CMD_SORT_NOW: u32 = 10;
 const CMD_SORT_UNDO: u32 = 11;
+const CMD_TOGGLE_ALL: u32 = 12;
+const NIN_SELECT: u32 = WM_USER;
+const NIN_KEYSELECT: u32 = WM_USER + 1;
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("DeskCrate");
+
+/// A snap line: screen coordinate and which edge sits on it (0 = left/top, 1 = right/bottom).
+pub type SnapLine = (i32, u8);
+/// Current snap per axis (x, y), for hysteresis.
+pub type SnapState = [Option<SnapLine>; 2];
 
 pub struct App {
     host: HWND,
@@ -91,6 +100,8 @@ pub struct App {
     sort_cfg: RefCell<Option<crate::sort::SortCfg>>,
     sort_watches: RefCell<Vec<watcher::WatchId>>,
     sort_notified: Cell<usize>,
+    /// Tray "hide all grids" (upstream `Tray.HideAll`), not persisted.
+    hidden_all: Cell<bool>,
 }
 
 /// `true` for windows that belong to this process (host, grids, dialogs…).
@@ -181,6 +192,7 @@ pub fn run(config_path: std::path::PathBuf) -> i32 {
     crate::util::log_mem("renderer");
     let look = (store.cfg.appearance.clone(), store.cfg.general.theme);
     let metrics = TileMetrics::new(&store.cfg.appearance);
+    let hide_ext = !store.cfg.appearance.show_extensions;
     let app: &'static App = Box::leak(Box::new(App {
         host,
         renderer,
@@ -189,9 +201,10 @@ pub fn run(config_path: std::path::PathBuf) -> i32 {
         theme: RefCell::new(Theme::new(true, Rgba::argb(0xFF4CC2FF), 0.18)),
         metrics: Cell::new(metrics),
         grids: RefCell::new(Vec::new()),
-        hide_ext: Cell::new(crate::shell::hide_known_extensions()),
+        hide_ext: Cell::new(hide_ext),
         applied: Cell::new(Applied::SystemBackdrop),
         tray_icon: Cell::new(HICON::default()),
+        hidden_all: Cell::new(false),
         next_token: Cell::new(1),
         taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
         last_look: RefCell::new(look),
@@ -212,10 +225,21 @@ pub fn run(config_path: std::path::PathBuf) -> i32 {
 
 fn message_loop() -> i32 {
     let mut msg = MSG::default();
+    let mut animating = false;
     loop {
-        // Alertable wait: directory-watch completion routines run here.
-        unsafe {
-            MsgWaitForMultipleObjectsEx(None, u32::MAX, QS_ALLINPUT, MWMO_ALERTABLE | MWMO_INPUTAVAILABLE);
+        if animating {
+            // Display-paced frame clock: block until the compositor's next vsync,
+            // then step every animation. Input queued meanwhile is handled first,
+            // so gestures can interrupt an animation on the very next frame.
+            unsafe {
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+                MsgWaitForMultipleObjectsEx(None, 0, QS_ALLINPUT, MWMO_ALERTABLE | MWMO_INPUTAVAILABLE);
+            }
+        } else {
+            // Alertable wait: directory-watch completion routines run here.
+            unsafe {
+                MsgWaitForMultipleObjectsEx(None, u32::MAX, QS_ALLINPUT, MWMO_ALERTABLE | MWMO_INPUTAVAILABLE);
+            }
         }
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
             if msg.message == WM_QUIT {
@@ -226,6 +250,7 @@ fn message_loop() -> i32 {
                 DispatchMessageW(&msg);
             }
         }
+        animating = app().frame();
     }
 }
 
@@ -268,10 +293,37 @@ impl App {
         let old = self.tray_icon.get();
         if let Some(icon) = tray::make_icon(size, theme::system_shell_dark()) {
             self.tray_icon.set(icon);
-            if !tray::add(self.host, WM_APP_TRAY, icon, "DeskCrate") {
+            if !tray::add(self.host, WM_APP_TRAY, icon, &self.tray_tip()) {
                 tray::set_icon(self.host, icon);
             }
             tray::destroy_icon(old);
+        }
+    }
+
+    fn tray_tip(&self) -> String {
+        tr(if self.peeking.get() { "tray.tip_raised" } else { "tray.tip_normal" })
+    }
+
+    fn update_tray_tip(&self) {
+        tray::set_tip(self.host, &self.tray_tip());
+    }
+
+    fn set_hidden_all(&self, hide: bool) {
+        self.hidden_all.set(hide);
+        if hide {
+            self.end_peek();
+        }
+        for g in self.grids.borrow().iter() {
+            let h = g.hwnd();
+            unsafe {
+                let _ = ShowWindow(h, if hide { SW_HIDE } else { SW_SHOWNOACTIVATE });
+            }
+            if !hide {
+                desktop::rebed(h);
+            }
+        }
+        if hide {
+            self.schedule_idle_trim();
         }
     }
 
@@ -322,6 +374,7 @@ impl App {
     fn restyle_all(&self) {
         self.refresh_theme();
         self.metrics.set(TileMetrics::new(&self.cfg().appearance));
+        self.hide_ext.set(!self.cfg().appearance.show_extensions);
         self.icons.borrow_mut().clear();
         self.renderer.clear_text_cache();
         for g in self.views() {
@@ -330,6 +383,8 @@ impl App {
                 self.apply_material(h);
             }
             g.reset_visuals();
+            // Names (extensions), hidden files and thumbnails may have changed.
+            g.reload();
         }
     }
 
@@ -358,6 +413,8 @@ impl App {
             self.restyle_all();
         }
         crate::util::set_log_enabled(cfg.general.log);
+        crate::i18n::set_language(&cfg.general.language);
+        self.update_tray_tip();
         sync_autostart(cfg.general.autostart);
         self.sync_hotkey(&cfg.general.hotkey);
         self.sync_sort(&cfg.sort);
@@ -579,22 +636,14 @@ impl App {
         if sc.dry_run {
             if plan.len() != self.sort_notified.get() {
                 self.sort_notified.set(plan.len());
-                tray::balloon(
-                    self.host,
-                    "DeskCrate 归档预览",
-                    &format!("{} 个文件符合归档规则（dry_run，未移动）。托盘 →「立即整理…」可查看并执行。", plan.len()),
-                );
+                tray::balloon(self.host, &tr("sort.preview_title"), &tr_n("sort.preview_body", plan.len()));
             }
             return;
         }
         let r = crate::sort::execute(&plan, &self.journal_path());
         crate::log!("sort: moved {}, skipped {}", r.moved.len(), r.skipped.len());
         if !r.moved.is_empty() {
-            tray::balloon(
-                self.host,
-                "DeskCrate 已自动归档",
-                &format!("已移动 {} 个文件，可在托盘「撤销上次归档」。", r.moved.len()),
-            );
+            tray::balloon(self.host, &tr("sort.auto_title"), &tr_n("sort.auto_body", r.moved.len()));
         }
     }
 
@@ -602,24 +651,24 @@ impl App {
     fn manual_sort(&self) {
         let plan = self.sort_plan();
         if plan.is_empty() {
-            tray::balloon(self.host, "DeskCrate", "没有符合归档规则的文件。");
+            tray::balloon(self.host, "DeskCrate", &tr("sort.none"));
             return;
         }
-        let mut text = String::from("将按规则移动以下文件（不会删除或覆盖任何文件，可撤销）：\n\n");
+        let mut text = format!("{}\n\n", tr("sort.confirm_head"));
         for m in plan.iter().take(20) {
             let name = m.from.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let dest = m.to.parent().map(|p| p.display().to_string()).unwrap_or_default();
             text.push_str(&format!("[{}] {name}  →  {dest}\n", m.rule));
         }
         if plan.len() > 20 {
-            text.push_str(&format!("…以及另外 {} 个文件\n", plan.len() - 20));
+            text.push_str(&format!("{}\n", tr_n("sort.more", plan.len() - 20)));
         }
-        text.push_str(&format!("\n共 {} 个文件，确定执行吗？", plan.len()));
+        text.push_str(&format!("\n{}", tr_n("sort.confirm_tail", plan.len())));
         let r = unsafe {
             MessageBoxW(
                 Some(self.host),
                 &HSTRING::from(text),
-                w!("DeskCrate · 整理预览"),
+                &HSTRING::from(tr("sort.confirm_title")),
                 MB_OKCANCEL | MB_ICONQUESTION,
             )
         };
@@ -628,20 +677,20 @@ impl App {
         }
         let rep = crate::sort::execute(&plan, &self.journal_path());
         self.sort_notified.set(0);
-        let mut msg = format!("已移动 {} 个文件。", rep.moved.len());
+        let mut msg = tr_n("sort.moved", rep.moved.len());
         if !rep.skipped.is_empty() {
-            msg.push_str(&format!("跳过 {} 个（占用或已变化）。", rep.skipped.len()));
+            msg.push_str(&tr_n("sort.skipped", rep.skipped.len()));
         }
-        tray::balloon(self.host, "DeskCrate 整理完成", &msg);
+        tray::balloon(self.host, &tr("sort.done_title"), &msg);
     }
 
     fn undo_sort(&self) {
         let r = crate::sort::undo_last(&self.journal_path());
-        let mut msg = format!("已移回 {} 个文件。", r.moved.len());
+        let mut msg = tr_n("sort.undo_moved", r.moved.len());
         if !r.skipped.is_empty() {
-            msg.push_str(&format!("{} 个无法移回（已被移动或删除）。", r.skipped.len()));
+            msg.push_str(&tr_n("sort.undo_skipped", r.skipped.len()));
         }
-        tray::balloon(self.host, "DeskCrate 已撤销归档", &msg);
+        tray::balloon(self.host, &tr("sort.undo_title"), &msg);
     }
 
     // ---- drawer mode ------------------------------------------------------------
@@ -676,7 +725,9 @@ impl App {
                     rect: None,
                     collapse: crate::config::CollapseMode::Expanded,
                     collapsed: false,
-                    locked: true,
+                    lock_position: true,
+                    lock_size: true,
+                    icon_size: None,
                 };
                 let d = Grid::new(gc, token, Kind::Drawer);
                 let r = RECT { left: 0, top: 0, right: 380, bottom: 600 };
@@ -796,6 +847,7 @@ impl App {
             return;
         }
         self.peeking.set(true);
+        self.update_tray_tip();
         for g in &grids {
             unsafe {
                 let _ =
@@ -811,6 +863,7 @@ impl App {
         if !self.peeking.replace(false) {
             return;
         }
+        self.update_tray_tip();
         for g in self.grids.borrow().clone() {
             let h = g.hwnd();
             unsafe {
@@ -836,51 +889,116 @@ impl App {
         }
         if !hotkey::register(self.host, HOTKEY_ID, spec) {
             crate::log!("hotkey '{spec}' unavailable");
-            tray::balloon(
-                self.host,
-                "DeskCrate 热键不可用",
-                &format!("“{spec}” 无效或已被其他程序占用，可在配置文件 [general] hotkey 中修改。"),
-            );
+            tray::balloon(self.host, &tr("hotkey.title"), &trf("hotkey.body", &[spec]));
         }
     }
 
-    /// Edge/peer snapping while dragging a grid (screen px).
-    pub fn snap_rect(&self, id: &str, r: RECT) -> RECT {
+    /// Snap candidates for grid `id` on the monitor of `r` (screen px):
+    /// (coordinate, edge) pairs per axis; edge 0 = left/top, 1 = right/bottom.
+    fn snap_lines(&self, id: &str, r: &RECT) -> Option<(Vec<SnapLine>, Vec<SnapLine>, f32)> {
         let mons = monitors::enumerate();
-        let Some(m) = monitors::for_rect(&mons, &r) else { return r };
+        let m = monitors::for_rect(&mons, r)?;
         let s = m.scale();
-        let th = (theme::SNAP_DISTANCE * s) as i32;
+        let th = (theme::SNAP_RELEASE * s) as i32;
         let gap = (theme::SNAP_GAP * s).round() as i32;
-        let (w, h) = (r.right - r.left, r.bottom - r.top);
-        let mut xs = vec![m.work.left + gap, m.work.right - gap - w];
-        let mut ys = vec![m.work.top + gap, m.work.bottom - gap - h];
+        // Lines a moving LEFT/TOP edge may sit on (0) and a RIGHT/BOTTOM edge may sit on (1).
+        let mut xs = vec![(m.work.left + gap, 0), (m.work.right - gap, 1)];
+        let mut ys = vec![(m.work.top + gap, 0), (m.work.bottom - gap, 1)];
         for g in self.grids.borrow().iter() {
-            if g.id == id || g.hwnd().is_invalid() {
+            if g.id == id || g.hwnd().is_invalid() || !unsafe { IsWindowVisible(g.hwnd()).as_bool() } {
                 continue;
             }
             let o = win::window_rect(g.hwnd());
             if o.top - th < r.bottom && r.top < o.bottom + th {
-                xs.extend([o.right + gap, o.left - gap - w, o.left, o.right - w]);
+                xs.extend([(o.right + gap, 0), (o.left, 0), (o.left - gap, 1), (o.right, 1)]);
             }
             if o.left - th < r.right && r.left < o.right + th {
-                ys.extend([o.bottom + gap, o.top - gap - h, o.top, o.bottom - h]);
+                ys.extend([(o.bottom + gap, 0), (o.top, 0), (o.top - gap, 1), (o.bottom, 1)]);
             }
         }
-        let pick = |v: i32, c: &[i32]| {
-            c.iter().copied().filter(|t| (t - v).abs() <= th).min_by_key(|t| (t - v).abs()).unwrap_or(v)
+        Some((xs, ys, s))
+    }
+
+    /// Upstream `ResizeGuideOverlayService` hysteresis: engage within 8 DIP,
+    /// stay snapped until pulled 12 DIP away.
+    fn pick_snap(v: i32, lines: &[(i32, u8)], edge: u8, prev: Option<i32>, engage: i32, release: i32) -> Option<i32> {
+        if let Some(p) = prev
+            && (p - v).abs() <= release
+            && lines.iter().any(|(c, e)| *c == p && *e == edge)
+        {
+            return Some(p);
+        }
+        lines
+            .iter()
+            .filter(|(c, e)| *e == edge && (c - v).abs() <= engage)
+            .min_by_key(|(c, _)| (c - v).abs())
+            .map(|(c, _)| *c)
+    }
+
+    /// Snaps a dragged grid. `prev` carries the previous (x, y) snap for the
+    /// hysteresis; returns the rect, the new snap state and the glowing edges
+    /// (left, top, right, bottom).
+    pub fn snap_move(&self, id: &str, r: RECT, prev: SnapState) -> (RECT, SnapState, [bool; 4]) {
+        let Some((xs, ys, s)) = self.snap_lines(id, &r) else { return (r, [None, None], [false; 4]) };
+        let (engage, release) = ((theme::SNAP_DISTANCE * s) as i32, (theme::SNAP_RELEASE * s) as i32);
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        let axis = |lo: i32, size: i32, lines: &[(i32, u8)], prev: Option<(i32, u8)>| -> (i32, Option<(i32, u8)>) {
+            let pl = prev.filter(|p| p.1 == 0).map(|p| p.0);
+            let ph = prev.filter(|p| p.1 == 1).map(|p| p.0);
+            let a = Self::pick_snap(lo, lines, 0, pl, engage, release);
+            let b = Self::pick_snap(lo + size, lines, 1, ph, engage, release);
+            match (a, b) {
+                (Some(a), Some(b)) if (a - lo).abs() <= (b - lo - size).abs() => (a, Some((a, 0))),
+                (_, Some(b)) => (b - size, Some((b, 1))),
+                (Some(a), None) => (a, Some((a, 0))),
+                (None, None) => (lo, None),
+            }
         };
-        let x = pick(r.left, &xs);
-        let y = pick(r.top, &ys);
-        RECT { left: x, top: y, right: x + w, bottom: y + h }
+        let (x, sx) = axis(r.left, w, &xs, prev[0]);
+        let (y, sy) = axis(r.top, h, &ys, prev[1]);
+        let edges = [
+            sx.is_some_and(|v| v.1 == 0),
+            sy.is_some_and(|v| v.1 == 0),
+            sx.is_some_and(|v| v.1 == 1),
+            sy.is_some_and(|v| v.1 == 1),
+        ];
+        (RECT { left: x, top: y, right: x + w, bottom: y + h }, [sx, sy], edges)
+    }
+
+    /// Snaps the edges being resized (`moving` = left, top, right, bottom).
+    pub fn snap_size(&self, id: &str, mut r: RECT, moving: [bool; 4], min: (i32, i32)) -> (RECT, [bool; 4]) {
+        let Some((xs, ys, s)) = self.snap_lines(id, &r) else { return (r, [false; 4]) };
+        let engage = (theme::SNAP_DISTANCE * s) as i32;
+        let mut glow = [false; 4];
+        let mut snap = |v: &mut i32, lines: &[(i32, u8)], edge: u8, i: usize| {
+            if let Some(c) = Self::pick_snap(*v, lines, edge, None, engage, engage) {
+                *v = c;
+                glow[i] = true;
+            }
+        };
+        if moving[0] {
+            snap(&mut r.left, &xs, 0, 0);
+            r.left = r.left.min(r.right - min.0);
+        }
+        if moving[2] {
+            snap(&mut r.right, &xs, 1, 2);
+            r.right = r.right.max(r.left + min.0);
+        }
+        if moving[1] {
+            snap(&mut r.top, &ys, 0, 1);
+            r.top = r.top.min(r.bottom - min.1);
+        }
+        if moving[3] {
+            snap(&mut r.bottom, &ys, 1, 3);
+            r.bottom = r.bottom.max(r.top + min.1);
+        }
+        (r, glow)
     }
 
     pub fn confirm_remove_grid(&self, id: &str) {
         let Some(g) = self.find_grid(id) else { return };
-        let text = format!(
-            "移除格子「{}」？\n\n只移除桌面上的这个格子，文件夹「{}」及其中的文件保持不变。",
-            g.title(),
-            g.st.borrow().dir
-        );
+        let dir = g.st.borrow().dir.clone();
+        let text = trf("remove.confirm", &[&g.title(), &dir]);
         let r = unsafe {
             MessageBoxW(Some(self.host), &HSTRING::from(text), w!("DeskCrate"), MB_OKCANCEL | MB_ICONQUESTION)
         };
@@ -890,7 +1008,7 @@ impl App {
         }
     }
 
-    fn new_grid(&self) {
+    pub fn new_grid(&self) {
         let Some(path) = pick_folder(self.host) else { return };
         let title = path.rsplit('\\').find(|s| !s.is_empty()).unwrap_or(&path).to_owned();
         self.store.borrow_mut().add_grid(&title, &path);
@@ -902,7 +1020,29 @@ impl App {
         unsafe { SetTimer(Some(self.host), TIMER_TRIM, 4000, None) };
     }
 
+    /// Steps every running animation once; `true` while any still needs frames.
+    pub fn frame(&self) -> bool {
+        let now = crate::ui::motion::now_ms();
+        let mut any = false;
+        for g in self.grids.borrow().iter() {
+            any |= g.frame(now);
+        }
+        if let Some(d) = self.drawer.borrow().as_ref() {
+            any |= d.frame(now);
+        }
+        any
+    }
+
     fn idle_trim(&self) {
+        // Never tear the renderer down under the pointer: the next hover would
+        // pay for rebuilding the D2D/DWrite stack and fault pages back in.
+        let mut p = POINT::default();
+        let busy = unsafe { GetCursorPos(&mut p).is_ok() && is_own_window(WindowFromPoint(p)) }
+            || self.views().iter().any(|g| g.is_busy());
+        if busy {
+            self.schedule_idle_trim();
+            return;
+        }
         self.icons.borrow_mut().drop_bitmaps();
         for g in self.views() {
             g.drop_text_cache();
@@ -939,14 +1079,18 @@ impl App {
         }
         let autostart = self.cfg().general.autostart;
         let drawer_mode = self.cfg().general.mode == Mode::Drawer;
-        let mut items = vec![
-            Extra::item(CMD_NEW, "新建格子…"),
-            Extra::item(CMD_REFRESH_ALL, "刷新全部"),
+        let hidden = self.hidden_all.get();
+        let mut items = vec![Extra::item(CMD_NEW, &tr("tray.new_grid"))];
+        if !drawer_mode {
+            items.push(Extra::item(CMD_TOGGLE_ALL, &tr(if hidden { "tray.show_all" } else { "tray.hide_all" })));
+        }
+        items.extend([
+            Extra::item(CMD_REFRESH_ALL, &tr("tray.refresh_all")),
             Extra::Separator,
-            Extra::check(CMD_DRAWER_MODE, "抽屉模式（桌面保持空白）", drawer_mode),
-        ];
+            Extra::check(CMD_DRAWER_MODE, &tr("tray.drawer_mode"), drawer_mode),
+        ]);
         if drawer_mode {
-            items.push(Extra::item(CMD_SHOW_DRAWER, "打开抽屉"));
+            items.push(Extra::item(CMD_SHOW_DRAWER, &tr("tray.open_drawer")));
         }
         let has_rules = !self.cfg().sort.rules.is_empty();
         let undo_n = crate::sort::last_batch_len(&self.journal_path());
@@ -954,22 +1098,23 @@ impl App {
             items.push(Extra::Separator);
         }
         if has_rules {
-            items.push(Extra::item(CMD_SORT_NOW, "立即整理…（先预览）"));
+            items.push(Extra::item(CMD_SORT_NOW, &tr("tray.sort_now")));
         }
         if undo_n > 0 {
-            items.push(Extra::item(CMD_SORT_UNDO, &format!("撤销上次归档（{undo_n} 个文件）")));
+            items.push(Extra::item(CMD_SORT_UNDO, &tr_n("tray.sort_undo", undo_n)));
         }
         items.extend([
             Extra::Separator,
-            Extra::item(CMD_EDIT_CONFIG, "编辑配置文件"),
-            Extra::item(CMD_OPEN_CONFIG_DIR, "打开配置所在文件夹"),
-            Extra::check(CMD_AUTOSTART, "开机自启", autostart),
+            Extra::item(CMD_EDIT_CONFIG, &tr("tray.edit_config")),
+            Extra::item(CMD_OPEN_CONFIG_DIR, &tr("tray.open_config_dir")),
+            Extra::check(CMD_AUTOSTART, &tr("tray.autostart"), autostart),
             Extra::Separator,
-            Extra::item(CMD_ABOUT, "关于 DeskCrate"),
-            Extra::item(CMD_EXIT, "退出"),
+            Extra::item(CMD_ABOUT, &tr("tray.about")),
+            Extra::item(CMD_EXIT, &tr("tray.exit")),
         ]);
         match menu::track_plain(self.host, pt, &items) {
             CMD_NEW => self.new_grid(),
+            CMD_TOGGLE_ALL => self.set_hidden_all(!hidden),
             CMD_REFRESH_ALL => {
                 self.icons.borrow_mut().clear();
                 for g in self.views() {
@@ -999,18 +1144,13 @@ impl App {
                 sync_autostart(!autostart);
             }
             CMD_ABOUT => {
-                let text = format!(
-                    "DeskCrate {}\n轻量、原生的 Windows 桌面文件收纳工具。\n\n\
-                     基于 DeskBox（github.com/Tianyu199509/DeskBox，GPL-3.0-only）的非官方 Rust 重写，\
-                     与原作者无关联，也未获其背书。\n许可证：GPL-3.0-only\n\n配置文件：{}",
-                    env!("CARGO_PKG_VERSION"),
-                    self.store.borrow().path.display()
-                );
+                let path = self.store.borrow().path.display().to_string();
+                let text = trf("about.body", &[env!("CARGO_PKG_VERSION"), &path]);
                 unsafe {
                     MessageBoxW(
                         Some(self.host),
                         &HSTRING::from(text),
-                        w!("关于 DeskCrate"),
+                        &HSTRING::from(tr("tray.about")),
                         MB_OK | MB_ICONINFORMATION,
                     );
                 }
@@ -1064,7 +1204,11 @@ impl App {
                     Ok(false) => {}
                     Err(e) => {
                         crate::log!("config reload failed: {e}");
-                        tray::balloon(self.host, "DeskCrate 配置有误", &format!("已保留当前设置：{e}"));
+                        tray::balloon(
+                            self.host,
+                            &tr("config.error_title"),
+                            &trf("config.error_body", &[&e.to_string()]),
+                        );
                     }
                 }
             }
@@ -1104,8 +1248,18 @@ impl App {
         match msg {
             WM_APP_TRAY => {
                 let event = loword(lp.0 as usize) as u32;
-                if event == WM_CONTEXTMENU || event == WM_USER || event == WM_LBUTTONUP {
+                // Upstream: left click temporarily raises the grids; right click opens the menu.
+                if event == WM_CONTEXTMENU || event == WM_USER {
                     self.tray_menu();
+                } else if event == NIN_SELECT || event == NIN_KEYSELECT || event == WM_LBUTTONUP {
+                    if self.cfg().general.mode == Mode::Drawer {
+                        self.toggle_drawer();
+                    } else {
+                        if self.hidden_all.get() {
+                            self.set_hidden_all(false);
+                        }
+                        self.toggle_peek();
+                    }
                 }
                 Some(LRESULT(0))
             }
@@ -1153,13 +1307,6 @@ impl App {
                         unsafe { SetTimer(Some(hwnd), TIMER_THEME, 200, None) };
                     }
                 }
-                let hide = crate::shell::hide_known_extensions();
-                if hide != self.hide_ext.get() {
-                    self.hide_ext.set(hide);
-                    for g in self.grids.borrow().clone() {
-                        g.reload();
-                    }
-                }
                 Some(LRESULT(0))
             }
             WM_DWMCOLORIZATIONCOLORCHANGED => {
@@ -1186,7 +1333,7 @@ impl App {
                 if self.cfg().general.mode == Mode::Drawer {
                     self.show_drawer(true);
                 } else {
-                    tray::balloon(self.host, "DeskCrate", "DeskCrate 已在运行，右键托盘图标管理格子。");
+                    tray::balloon(self.host, "DeskCrate", &tr("running"));
                 }
                 Some(LRESULT(1))
             }
@@ -1225,7 +1372,7 @@ fn pick_folder(owner: HWND) -> Option<String> {
         let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
         let opts = dlg.GetOptions().ok()?;
         dlg.SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST).ok()?;
-        let _ = dlg.SetTitle(w!("选择要映射为格子的文件夹"));
+        let _ = dlg.SetTitle(&HSTRING::from(crate::i18n::tr("pick_folder")));
         dlg.Show(Some(owner)).ok()?;
         let item = dlg.GetResult().ok()?;
         let p = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;

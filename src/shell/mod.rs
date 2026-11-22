@@ -127,15 +127,6 @@ pub fn open_with_verb(path: &str, verb: &str) -> bool {
     unsafe { ShellExecuteExW(&mut sei).is_ok() }
 }
 
-/// Explorer's "hide extensions for known file types" setting.
-pub fn hide_known_extensions() -> bool {
-    use windows::Win32::UI::Shell::{SHELLSTATEA, SHGetSetSettings, SSF_SHOWEXTENSIONS};
-    let mut ss = SHELLSTATEA::default();
-    unsafe { SHGetSetSettings(Some(&mut ss), SSF_SHOWEXTENSIONS, false) };
-    // fShowExtensions is bit 1 of the first bitfield.
-    (ss._bitfield1 & 0x2) == 0
-}
-
 /// Renames via `IFileOperation`: undoable from Explorer (Ctrl+Z) and shows the
 /// native conflict / error UI. Returns `true` when the operation ran.
 pub fn rename(owner: HWND, path: &str, new_name: &str) -> bool {

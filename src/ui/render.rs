@@ -17,10 +17,11 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE,
     D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_GAMMA_2_2,
-    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE,
-    D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap,
-    ID2D1DCRenderTarget, ID2D1Factory, ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
+    D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1PathGeometry, ID2D1RenderTarget,
+    ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
@@ -379,6 +380,8 @@ fn pick_font(dw: &IDWriteFactory, names: &[&str]) -> HSTRING {
     HSTRING::from(names[names.len() - 1])
 }
 
+const IDENTITY: Matrix3x2 = Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 };
+
 /// Drawing API handed to window painters (coordinates in DIP).
 pub struct Canvas<'a> {
     r: &'a Renderer,
@@ -437,16 +440,115 @@ impl Canvas<'_> {
         unsafe { self.rt.PopAxisAlignedClip() };
     }
 
+    /// Starts a group drawn at `opacity`, offset by `dy` and scaled by `scale`
+    /// around the centre of `bounds` (used for fold transitions). Pair with `pop_group`.
+    pub fn push_group(&self, bounds: RectF, opacity: f32, dy: f32, scale: f32) -> bool {
+        unsafe {
+            let Ok(layer) = self.rt.CreateLayer(None) else { return false };
+            let params = D2D1_LAYER_PARAMETERS {
+                contentBounds: rect(bounds),
+                geometricMask: std::mem::ManuallyDrop::new(None),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: IDENTITY,
+                opacity: opacity.clamp(0.0, 1.0),
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS_NONE,
+            };
+            self.rt.PushLayer(&params, &layer);
+            let (cx, cy) = ((bounds.l + bounds.r) / 2.0, (bounds.t + bounds.b) / 2.0);
+            let m = Matrix3x2 {
+                M11: scale,
+                M12: 0.0,
+                M21: 0.0,
+                M22: scale,
+                M31: cx - cx * scale,
+                M32: cy - cy * scale + dy,
+            };
+            self.rt.SetTransform(&m);
+        }
+        true
+    }
+
+    /// Scales subsequent drawing by `k` around (cx, cy); returns the transform to restore.
+    pub fn scale_about(&self, cx: f32, cy: f32, k: f32) -> Matrix3x2 {
+        let mut cur = IDENTITY;
+        unsafe {
+            self.rt.GetTransform(&mut cur);
+            let m = Matrix3x2 {
+                M11: k * cur.M11,
+                M12: 0.0,
+                M21: 0.0,
+                M22: k * cur.M22,
+                M31: (cx - cx * k) * cur.M11 + cur.M31,
+                M32: (cy - cy * k) * cur.M22 + cur.M32,
+            };
+            self.rt.SetTransform(&m);
+        }
+        cur
+    }
+
+    /// Fills `r` with a linear gradient from (x0,y0) to (x1,y1) through `stops`.
+    pub fn fill_gradient(&self, r: RectF, from: (f32, f32), to: (f32, f32), stops: &[(f32, Rgba)]) {
+        let st: Vec<D2D1_GRADIENT_STOP> =
+            stops.iter().map(|&(p, c)| D2D1_GRADIENT_STOP { position: p, color: c.d2d() }).collect();
+        unsafe {
+            let Ok(coll) = self.rt.CreateGradientStopCollection(&st, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else {
+                return;
+            };
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                startPoint: Vector2 { X: from.0, Y: from.1 },
+                endPoint: Vector2 { X: to.0, Y: to.1 },
+            };
+            if let Ok(b) = self.rt.CreateLinearGradientBrush(&props, None, &coll) {
+                self.rt.FillRectangle(&rect(r), &b);
+            }
+        }
+    }
+
+    pub fn set_transform(&self, m: Matrix3x2) {
+        unsafe { self.rt.SetTransform(&m) };
+    }
+
+    pub fn pop_group(&self) {
+        unsafe {
+            self.rt.SetTransform(&IDENTITY);
+            self.rt.PopLayer();
+        }
+    }
+
     /// Draws a multi-layer vector icon (viewBox `size`×`size`) into `r`.
     pub fn vector(&self, layers: &[crate::ui::vector::Layer], size: f32, r: RectF) {
+        self.vector_at(layers, r.w() / size, r.l, r.t, Rgba::argb(0));
+    }
+
+    /// Draws a monochrome glyph with its path bounds fitted (uniform, centred)
+    /// into `r` — XAML `Path Stretch="Uniform"`.
+    pub fn glyph_fit(&self, g: &crate::ui::vector::Glyph, r: RectF, color: Rgba) {
+        let (x0, y0, x1, y1) = g.bounds;
+        let k = (r.w() / (x1 - x0)).min(r.h() / (y1 - y0));
+        let ox = r.l + (r.w() - (x1 - x0) * k) / 2.0 - x0 * k;
+        let oy = r.t + (r.h() - (y1 - y0) * k) / 2.0 - y0 * k;
+        self.vector_at(g.layers, k, ox, oy, color);
+    }
+
+    fn vector_at(&self, layers: &[crate::ui::vector::Layer], k: f32, ox: f32, oy: f32, color: Rgba) {
         use crate::ui::vector::Fill;
-        let k = r.w() / size;
-        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: r.l, M32: r.t };
+        let mut cur = IDENTITY;
+        unsafe { self.rt.GetTransform(&mut cur) };
+        let m = Matrix3x2 {
+            M11: k * cur.M11,
+            M12: 0.0,
+            M21: 0.0,
+            M22: k * cur.M22,
+            M31: ox * cur.M11 + cur.M31,
+            M32: oy * cur.M22 + cur.M32,
+        };
         unsafe {
             self.rt.SetTransform(&m);
             for layer in layers {
                 let Some(geom) = self.r.geometry(layer.d) else { continue };
                 match layer.fill {
+                    Fill::Current => self.rt.FillGeometry(&geom, self.brush(color), None),
                     Fill::Linear { from, to, stops } => {
                         let st: Vec<D2D1_GRADIENT_STOP> = stops
                             .iter()
@@ -467,12 +569,28 @@ impl Canvas<'_> {
                     }
                 }
             }
-            self.rt.SetTransform(&Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 });
+            self.rt.SetTransform(&cur);
         }
     }
 
     pub fn bitmap(&self, b: &ID2D1Bitmap, r: RectF, opacity: f32) {
         unsafe { self.rt.DrawBitmap(b, Some(&rect(r)), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+    }
+
+    /// Draws `b` aspect-fitted into `r`, bottom-centred like Explorer thumbnails.
+    pub fn bitmap_fit(&self, b: &ID2D1Bitmap, r: RectF, opacity: f32) {
+        let sz = unsafe { b.GetPixelSize() };
+        let (bw, bh) = (sz.width.max(1) as f32, sz.height.max(1) as f32);
+        if (bw - bh).abs() < 1.0 {
+            return self.bitmap(b, r, opacity);
+        }
+        let k = (r.w() / bw).min(r.h() / bh);
+        let (w, h) = (bw * k, bh * k);
+        let px = 1.0 / crate::win::scale(self.dpi).max(1.0);
+        let snap = |v: f32| (v / px).round() * px;
+        let l = snap(r.l + (r.w() - w) / 2.0);
+        let t = snap(r.b - h);
+        self.bitmap(b, RectF::new(l, t, l + snap(w), t + snap(h)), opacity);
     }
 
     pub fn text_layout(&self, l: &IDWriteTextLayout, x: f32, y: f32, c: Rgba) {

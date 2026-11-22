@@ -29,6 +29,16 @@ impl Rgba {
     pub fn scale_alpha(self, k: f32) -> Self {
         Rgba { a: (self.a * k).clamp(0.0, 1.0), ..self }
     }
+    /// Linear blend from `self` (k = 0) to `o` (k = 1), premultiplied-aware.
+    pub fn mix(self, o: Rgba, k: f32) -> Self {
+        let k = k.clamp(0.0, 1.0);
+        let a = self.a + (o.a - self.a) * k;
+        if a <= 0.0 {
+            return Rgba { a: 0.0, ..o };
+        }
+        let ch = |x: f32, y: f32| (x * self.a * (1.0 - k) + y * o.a * k) / a;
+        Rgba { r: ch(self.r, o.r), g: ch(self.g, o.g), b: ch(self.b, o.b), a }
+    }
     pub fn d2d(self) -> D2D1_COLOR_F {
         D2D1_COLOR_F { r: self.r, g: self.g, b: self.b, a: self.a }
     }
@@ -42,7 +52,11 @@ pub const TITLE_PAD_R: f32 = 12.0;
 pub const TITLE_ICON: f32 = 18.0;
 pub const TITLE_ICON_GAP: f32 = 8.0;
 pub const TITLE_TEXT: f32 = 13.0;
-pub const TITLE_BUTTON: f32 = 26.0;
+/// Upstream `WidgetTitleBarMetricsCalculator`: clamp(titleIcon 11 + 14, 24, 34).
+pub const TITLE_BUTTON: f32 = 25.0;
+/// Action icon box: round(min(20, button - 4) × 0.63).
+pub const TITLE_ACTION_ICON: f32 = 13.0;
+pub const TITLE_BUTTON_GAP: f32 = 2.0;
 pub const DIVIDER_MARGIN_H: f32 = 12.0;
 pub const DIVIDER_MARGIN_B: f32 = 4.0;
 pub const DIVIDER_OPACITY: f32 = 0.62;
@@ -54,12 +68,30 @@ pub const CONTENT_PAD_BOTTOM: f32 = 8.0;
 pub const RESIZE_EDGE: f32 = 6.0;
 pub const SCROLLBAR_W: f32 = 3.0;
 pub const SNAP_GAP: f32 = 5.0;
+/// Upstream snap engage / release thresholds (hysteresis) in DIP.
 pub const SNAP_DISTANCE: f32 = 8.0;
-pub const CAPSULE_H: f32 = 42.0;
+pub const SNAP_RELEASE: f32 = 12.0;
+/// Edge glow band shown while snapped (upstream `HighlightBandDips`).
+pub const SNAP_GLOW: f32 = 10.0;
+/// Upstream `WidgetCompactBoundsCalculator.SmartDetailHeight` (default "Smart" capsule).
+pub const CAPSULE_H: f32 = 52.0;
+pub const CAPSULE_PAD_L: f32 = 8.0;
+pub const CAPSULE_PAD_R: f32 = 6.0;
+/// `CompactIdentityHost` 36×28 holding a 22 DIP icon.
+pub const CAPSULE_IDENTITY_W: f32 = 36.0;
+pub const CAPSULE_ICON: f32 = 22.0;
+pub const CAPSULE_TITLE: f32 = 12.5;
+pub const CAPSULE_SUMMARY: f32 = 11.5;
+pub const CAPSULE_BUTTON: f32 = 24.0;
 pub const MIN_W: f32 = 140.0;
 pub const MIN_H: f32 = 90.0;
 pub const DEFAULT_W: f32 = 280.0;
 pub const DEFAULT_H: f32 = 400.0;
+
+/// File tiles use half the control radius (upstream `SurfaceBorder` CornerRadius 2 at "Round").
+pub fn tile_radius(inner: f32) -> f32 {
+    inner / 2.0
+}
 
 /// Corner radii for the four upstream presets: (outer, inner).
 pub fn corner_radii(corner: crate::config::Corner) -> (f32, f32) {
@@ -84,13 +116,20 @@ pub struct Theme {
     pub tint: Rgba,
     pub shadow: Rgba,
     pub hover: Rgba,
+    /// Pressed state: a touch stronger than hover so a press reads instantly (iOS-like).
+    pub pressed: Rgba,
     pub selected: Rgba,
     pub selected_hover: Rgba,
     pub selected_unfocused: Rgba,
     pub selected_unfocused_hover: Rgba,
     pub selected_border: Rgba,
     pub placeholder: Rgba,
+    pub placeholder_stroke: Rgba,
     pub scrollbar: Rgba,
+    /// Upstream `NeutralInteractionBrush`: marquee wash and transient outlines
+    /// (marquee, drop preview) use neutral tones, not the accent.
+    pub neutral_fill: Rgba,
+    pub neutral_line: Rgba,
 }
 
 impl Theme {
@@ -112,13 +151,17 @@ impl Theme {
                 tint: Rgba::argb(0xFF1C1C1C).with_alpha(tint_alpha),
                 shadow: Rgba::argb(0x8C000000),
                 hover: layer(0x14, 0x0F),
+                pressed: layer(0x24, 0x1A),
                 selected: layer(0x28, 0x20),
                 selected_hover: layer(0x38, 0x2D),
                 selected_unfocused: layer(0x10, 0x0C),
                 selected_unfocused_hover: layer(0x1C, 0x15),
                 selected_border: Rgba::argb(0x8BFFFFFF),
                 placeholder: Rgba::argb(0x0AFFFFFF),
+                placeholder_stroke: Rgba::argb(0x0F000000),
                 scrollbar: Rgba::argb(0x66FFFFFF),
+                neutral_fill: Rgba::argb(0x0FFFFFFF),
+                neutral_line: Rgba::argb(0x8BFFFFFF),
             }
         } else {
             Theme {
@@ -131,13 +174,17 @@ impl Theme {
                 tint: Rgba::argb(0xFFF3F3F3).with_alpha(tint_alpha),
                 shadow: Rgba::argb(0x59FFFFFF),
                 hover: layer(0x14, 0x0F),
+                pressed: layer(0x24, 0x1A),
                 selected: layer(0x28, 0x20),
                 selected_hover: layer(0x38, 0x2D),
                 selected_unfocused: layer(0x10, 0x0C),
                 selected_unfocused_hover: layer(0x1C, 0x15),
                 selected_border: Rgba::argb(0x72000000),
                 placeholder: Rgba::argb(0x0A000000),
+                placeholder_stroke: Rgba::argb(0x09000000),
                 scrollbar: Rgba::argb(0x66000000),
+                neutral_fill: Rgba::argb(0x09000000),
+                neutral_line: Rgba::argb(0x72000000),
             }
         }
     }

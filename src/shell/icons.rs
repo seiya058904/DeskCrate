@@ -3,6 +3,7 @@
 //! Extraction runs on one STA worker thread (slow shell extensions never block
 //! the UI). The worker blocks on a channel, so it costs no CPU when idle.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -15,7 +16,9 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, IBindCtx};
-use windows::Win32::UI::Shell::{IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY};
+use windows::Win32::UI::Shell::{
+    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF, SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT,
+};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{HSTRING, Interface};
 
@@ -27,6 +30,51 @@ pub enum IconKey {
     Path(String),
     /// Plain folder.
     Folder,
+    /// Per-file thumbnail (images, videos, documents with a thumbnail handler).
+    Thumb(String),
+}
+
+/// Media types upstream always previews (`IconHelper.IsMediaFile`).
+const MEDIA: &[&str] = &[
+    "jpg", "jpeg", "jfif", "png", "gif", "bmp", "webp", "heic", "heif", "avif", "tif", "tiff", "ico", "jxl", "dng",
+    "mp4", "m4v", "mov", "mkv", "avi", "wmv", "webm", "mpg", "mpeg", "3gp",
+];
+
+thread_local! {
+    static THUMB_EXT: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
+}
+
+/// `true` when files of `ext` get a shell thumbnail: media, or any type with a
+/// registered `IThumbnailProvider` (PDF, PSD, Office…), like upstream does.
+pub fn has_thumbnail(ext: &str) -> bool {
+    if ext.is_empty() {
+        return false;
+    }
+    if MEDIA.contains(&ext) {
+        return true;
+    }
+    THUMB_EXT.with(|m| {
+        if let Some(v) = m.borrow().get(ext) {
+            return *v;
+        }
+        let v = thumbnail_handler_registered(ext);
+        m.borrow_mut().insert(ext.to_owned(), v);
+        v
+    })
+}
+
+fn thumbnail_handler_registered(ext: &str) -> bool {
+    use windows::Win32::System::Registry::{HKEY, HKEY_CLASSES_ROOT, KEY_READ, RegCloseKey, RegOpenKeyExW};
+    const IID: &str = r"ShellEx\{E357FCCD-A995-4576-B01F-234630154E96}";
+    let exists = |sub: String| unsafe {
+        let mut k = HKEY::default();
+        let ok = RegOpenKeyExW(HKEY_CLASSES_ROOT, &HSTRING::from(sub), Some(0), KEY_READ, &mut k).is_ok();
+        if ok {
+            let _ = RegCloseKey(k);
+        }
+        ok
+    };
+    exists(format!(r".{ext}\{IID}")) || exists(format!(r"SystemFileAssociations\.{ext}\{IID}"))
 }
 
 struct Request {
@@ -187,7 +235,11 @@ fn worker(rx: Receiver<Request>, tx: Sender<Reply>, notify: isize, msg: u32) {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     }
     while let Ok(req) = rx.recv() {
-        let image = extract(&req.path, req.px);
+        let flags = if matches!(req.key, IconKey::Thumb(_)) { SIIGBF_RESIZETOFIT } else { SIIGBF_ICONONLY };
+        let image = extract(&req.path, req.px, flags).or_else(|| {
+            // No thumbnail (corrupt file, missing codec): fall back to the type icon.
+            (flags != SIIGBF_ICONONLY).then(|| extract(&req.path, req.px, SIIGBF_ICONONLY)).flatten()
+        });
         if tx.send(Reply { key: req.key, px: req.px, image }).is_err() {
             break;
         }
@@ -198,11 +250,11 @@ fn worker(rx: Receiver<Request>, tx: Sender<Reply>, notify: isize, msg: u32) {
 }
 
 /// Extracts the icon of `path` at `px` pixels as premultiplied, top-down BGRA.
-fn extract(path: &str, px: u32) -> Option<(u32, u32, Vec<u8>)> {
+fn extract(path: &str, px: u32, flags: SIIGBF) -> Option<(u32, u32, Vec<u8>)> {
     unsafe {
         let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(path), None::<&IBindCtx>).ok()?;
         let factory: IShellItemImageFactory = item.cast().ok()?;
-        let hbm = factory.GetImage(SIZE { cx: px as i32, cy: px as i32 }, SIIGBF_ICONONLY).ok()?;
+        let hbm = factory.GetImage(SIZE { cx: px as i32, cy: px as i32 }, flags).ok()?;
         let mut bm = BITMAP::default();
         let got = GetObjectW(HGDIOBJ(hbm.0), std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut _));
         let result = (|| {
