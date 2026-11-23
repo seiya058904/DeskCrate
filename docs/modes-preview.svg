@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="340" viewBox="0 0 1280 340" role="img" aria-labelledby="t d">
+  <title id="t">DeskCrate — Three Modes: Desktop Grid, Smart Capsule, and Edge Drawer</title>
+  <desc id="d">Three-panel vector diagram illustrating DeskCrate's Desktop Grid, Smart Capsule hover expansion, and Screen-Edge Drawer mode.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0D1424"/>
+      <stop offset="1" stop-color="#162338"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1E2D45" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#152033" stop-opacity="0.9"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="340" rx="18" fill="url(#bg)"/>
+  <rect x="1" y="1" width="1278" height="338" rx="17" fill="none" stroke="#475569" stroke-opacity="0.35"/>
+
+  <!-- Panel 1: Real-Folder Grid -->
+  <g transform="translate(36, 30)">
+    <rect width="376" height="280" rx="14" fill="url(#panel)" stroke="#60A5FA" stroke-opacity="0.28"/>
+    <text x="24" y="34" fill="#60A5FA" font-family="Consolas, monospace" font-size="12" font-weight="700" letter-spacing="2">01 · REAL-FOLDER GRID</text>
+    <text x="24" y="58" fill="#F1F5F9" font-family="Segoe UI, sans-serif" font-size="17" font-weight="700">Live view of any folder</text>
+    <rect x="24" y="78" width="328" height="148" rx="10" fill="#0F172A" stroke="#334155"/>
+    <rect x="38" y="90" width="84" height="10" rx="5" fill="#94A3B8" fill-opacity="0.5"/>
+    <line x1="38" y1="110" x2="338" y2="110" stroke="#334155"/>
+    <g fill="#1E293B" stroke="#475569">
+      <rect x="40" y="122" width="64" height="42" rx="6"/>
+      <rect x="116" y="122" width="64" height="42" rx="6"/>
+      <rect x="192" y="122" width="64" height="42" rx="6"/>
+      <rect x="268" y="122" width="64" height="42" rx="6"/>
+      <rect x="40" y="172" width="64" height="42" rx="6"/>
+      <rect x="116" y="172" width="64" height="42" rx="6"/>
+    </g>
+    <rect x="40" y="122" width="64" height="42" rx="6" fill="#3B82F6" fill-opacity="0.22" stroke="#60A5FA"/>
+    <text x="24" y="254" fill="#94A3B8" font-family="Segoe UI, sans-serif" font-size="12">Survives Win+D · Explorer menus · OLE drag &amp; drop</text>
+  </g>
+
+  <!-- Panel 2: Smart Capsule -->
+  <g transform="translate(452, 30)">
+    <rect width="376" height="280" rx="14" fill="url(#panel)" stroke="#34D399" stroke-opacity="0.28"/>
+    <text x="24" y="34" fill="#34D399" font-family="Consolas, monospace" font-size="12" font-weight="700" letter-spacing="2">02 · SMART CAPSULE</text>
+    <text x="24" y="58" fill="#F1F5F9" font-family="Segoe UI, sans-serif" font-size="17" font-weight="700">Folded until you hover or click</text>
+    <!-- Folded pill -->
+    <rect x="38" y="88" width="300" height="46" rx="23" fill="#0F172A" stroke="#34D399" stroke-opacity="0.65" stroke-width="1.3"/>
+    <circle cx="64" cy="111" r="10" fill="#10B981" fill-opacity="0.28"/>
+    <text x="86" y="109" fill="#F8FAFC" font-family="Segoe UI, sans-serif" font-size="13" font-weight="600">Downloads</text>
+    <text x="86" y="123" fill="#94A3B8" font-family="Segoe UI, sans-serif" font-size="10.5">latest-build.zip</text>
+    <rect x="296" y="100" width="28" height="22" rx="11" fill="#10B981" fill-opacity="0.22"/>
+    <text x="310" y="115" text-anchor="middle" fill="#6EE7B7" font-family="Consolas, monospace" font-size="11" font-weight="700">18</text>
+    <!-- Spring arrow -->
+    <path d="M188 140v20m-5-5l5 5 5-5" fill="none" stroke="#34D399" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- Expanded box -->
+    <rect x="24" y="168" width="328" height="58" rx="10" fill="#0F172A" stroke="#334155" stroke-dasharray="4 4"/>
+    <text x="188" y="193" text-anchor="middle" fill="#CBD5E1" font-family="Segoe UI, sans-serif" font-size="12">Interruptible spring expansion</text>
+    <text x="188" y="211" text-anchor="middle" fill="#64748B" font-family="Segoe UI, sans-serif" font-size="11">Opens upward automatically when docked low</text>
+    <text x="24" y="254" fill="#94A3B8" font-family="Segoe UI, sans-serif" font-size="12">Shows title, latest changed item &amp; item count</text>
+  </g>
+
+  <!-- Panel 3: Edge Drawer -->
+  <g transform="translate(868, 30)">
+    <rect width="376" height="280" rx="14" fill="url(#panel)" stroke="#A78BFA" stroke-opacity="0.28"/>
+    <text x="24" y="34" fill="#A78BFA" font-family="Consolas, monospace" font-size="12" font-weight="700" letter-spacing="2">03 · DRAWER MODE</text>
+    <text x="24" y="58" fill="#F1F5F9" font-family="Segoe UI, sans-serif" font-size="17" font-weight="700">Keep the desktop completely clean</text>
+    <!-- Monitor outline -->
+    <rect x="24" y="78" width="328" height="148" rx="10" fill="#0F172A" stroke="#334155"/>
+    <text x="108" y="156" text-anchor="middle" fill="#475569" font-family="Segoe UI, sans-serif" font-size="12.5">Empty wallpaper</text>
+    <!-- Sliding drawer on right -->
+    <rect x="194" y="84" width="152" height="136" rx="8" fill="#1E293B" stroke="#A78BFA" stroke-opacity="0.7" stroke-width="1.2"/>
+    <rect x="204" y="94" width="42" height="16" rx="4" fill="#8B5CF6" fill-opacity="0.35"/>
+    <rect x="252" y="94" width="42" height="16" rx="4" fill="#334155"/>
+    <rect x="300" y="94" width="36" height="16" rx="4" fill="#334155"/>
+    <rect x="204" y="120" width="132" height="24" rx="5" fill="#0F172A"/>
+    <rect x="204" y="150" width="132" height="24" rx="5" fill="#0F172A"/>
+    <rect x="204" y="180" width="132" height="24" rx="5" fill="#0F172A"/>
+    <rect x="348" y="114" width="4" height="76" rx="2" fill="#A78BFA"/>
+    <text x="24" y="254" fill="#94A3B8" font-family="Segoe UI, sans-serif" font-size="12">Ctrl+Alt+D or edge hot zone · yields to full-screen</text>
+  </g>
+</svg>
